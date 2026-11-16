@@ -4,18 +4,18 @@
 
 App **gratuita e open source** per Windows e macOS che mostra cosa occupa spazio sul computer (cartelle, file grandi, giochi, doppioni, archivi già estratti) e sposta nel Cestino solo ciò che scegli tu. Funziona offline e non invia dati a nessuno.
 
-- Sito, privacy, termini e cookie: **https://{{GITHUB_USER}}.github.io/{{REPO}}/**
-- Download: [ultima versione](https://github.com/{{GITHUB_USER}}/{{REPO}}/releases/latest) (con `SHA256SUMS` per verificare i file)
+- Sito, privacy, termini e cookie: **https://twoventi.github.io/twenties-cleaning/**
+- Download: [ultima versione](https://github.com/twoventi/twenties-cleaning/releases/latest) (con `SHA256SUMS` per verificare i file)
 - Interfaccia dell'app in italiano.
 
 ## Per gli utenti
-Scarica il file per il tuo sistema, aprilo e segui la pagina che compare nel browser. I programmi non hanno la firma a pagamento, quindi Windows e macOS mostrano un avviso la prima volta: le istruzioni sono nelle [domande frequenti](https://{{GITHUB_USER}}.github.io/{{REPO}}/#faq).
+Scarica il file per il tuo sistema, aprilo e segui la pagina che compare nel browser. I programmi non hanno la firma a pagamento, quindi Windows e macOS mostrano un avviso la prima volta: le istruzioni sono nelle [domande frequenti](https://twoventi.github.io/twenties-cleaning/#faq).
 
 ## Per chi pubblica o modifica il progetto
 
 ### 1. Personalizza i segnaposto (una volta sola)
 ```
-python3 scripts/personalize.py --user TUO_UTENTE_GITHUB --repo {{REPO}} --name "Nome Cognome" --email tua@email
+python3 scripts/personalize.py --user TUO_UTENTE_GITHUB --repo twenties-cleaning --name "Nome Cognome" --email tua@email
 ```
 Questo inserisce nome, email e indirizzi in sito, licenza e sicurezza. Rilancia lo script solo su una copia pulita.
 
@@ -54,9 +54,9 @@ python3 scripts/make_assets.py   # rigenera icone e illustrazioni originali
 
 A **free, open source** app for Windows and macOS that shows what is taking up disk space (folders, large files, games, duplicates, already-extracted archives) and moves only what you choose to the Recycle Bin. It works offline and sends no data anywhere. The app interface is in Italian.
 
-- Website, privacy, terms and cookies: **https://{{GITHUB_USER}}.github.io/{{REPO}}/**
-- Downloads: [latest release](https://github.com/{{GITHUB_USER}}/{{REPO}}/releases/latest) (with `SHA256SUMS` to verify the files)
+- Website, privacy, terms and cookies: **https://twoventi.github.io/twenties-cleaning/**
+- Downloads: [latest release](https://github.com/twoventi/twenties-cleaning/releases/latest) (with `SHA256SUMS` to verify the files)
 
-The programs have no paid code signature, so Windows and macOS show a warning on first launch; see the [FAQ](https://{{GITHUB_USER}}.github.io/{{REPO}}/?lang=en#faq). To publish: run `scripts/personalize.py`, push to GitHub, enable Pages (main / docs), then push a tag like `v1.0.0` to build the releases.
+The programs have no paid code signature, so Windows and macOS show a warning on first launch; see the [FAQ](https://twoventi.github.io/twenties-cleaning/?lang=en#faq). To publish: run `scripts/personalize.py`, push to GitHub, enable Pages (main / docs), then push a tag like `v1.0.0` to build the releases.
 
 License: [MIT](LICENSE).
