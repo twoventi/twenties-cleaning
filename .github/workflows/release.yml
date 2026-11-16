@@ -1,0 +1,107 @@
+name: Build and release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip pyinstaller
+      - name: Build
+        run: pyinstaller --noconfirm --onefile --windowed --name Twenties-Cleaning --icon assets/icon.ico src/twenties_cleaning.py
+      - name: Smoke test (the built app must start and answer)
+        shell: pwsh
+        run: |
+          $env:TC_PORT = "8795"
+          $p = Start-Process -FilePath "dist/Twenties-Cleaning.exe" -PassThru
+          $ok = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 2
+            try { $r = Invoke-WebRequest -Uri "http://127.0.0.1:8795/api/me" -UseBasicParsing; if ($r.StatusCode -eq 200) { $ok = $true; break } } catch {}
+          }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          if (-not $ok) { throw "Smoke test failed: the app did not answer" }
+      - run: Move-Item dist/Twenties-Cleaning.exe Twenties-Cleaning-Windows.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: Twenties-Cleaning-Windows.exe
+
+  macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            suffix: AppleSilicon
+          - runner: macos-15-intel
+            suffix: Intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip pyinstaller
+      - name: Make .icns icon
+        run: |
+          mkdir icon.iconset
+          for s in 16 32 128 256 512; do
+            sips -z $s $s assets/icon.png --out icon.iconset/icon_${s}x${s}.png
+            sips -z $((s*2)) $((s*2)) assets/icon.png --out icon.iconset/icon_${s}x${s}@2x.png
+          done
+          iconutil -c icns icon.iconset -o assets/icon.icns
+      - name: Build
+        run: pyinstaller --noconfirm --windowed --name "Twenties Cleaning" --icon assets/icon.icns --osx-bundle-identifier "io.github.${{ github.repository_owner }}.twentiescleaning" src/twenties_cleaning.py
+      - name: Finder permission text and ad-hoc signature
+        run: |
+          /usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string Twenties Cleaning usa Finder solo per spostare nel Cestino i file che scegli." "dist/Twenties Cleaning.app/Contents/Info.plist"
+          codesign --force --deep --sign - "dist/Twenties Cleaning.app"
+      - name: Smoke test (the built app must start and answer)
+        run: |
+          TC_PORT=8795 "dist/Twenties Cleaning.app/Contents/MacOS/Twenties Cleaning" &
+          APP_PID=$!
+          ok=0
+          for i in $(seq 1 30); do
+            sleep 2
+            if curl -fsS http://127.0.0.1:8795/api/me >/dev/null; then ok=1; break; fi
+          done
+          kill $APP_PID || true
+          [ "$ok" = "1" ] || { echo "Smoke test failed: the app did not answer"; exit 1; }
+      - name: Make .dmg
+        run: |
+          mkdir dmg
+          cp -R "dist/Twenties Cleaning.app" dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "Twenties Cleaning" -srcfolder dmg -ov -format UDZO "Twenties-Cleaning-macOS-${{ matrix.suffix }}.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.suffix }}
+          path: Twenties-Cleaning-macOS-${{ matrix.suffix }}.dmg
+
+  release:
+    needs: [windows, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Checksums
+        run: cd out && sha256sum Twenties-Cleaning-* > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true

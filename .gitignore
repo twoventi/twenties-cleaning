@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+.env
+*.db
+*.db-wal
+*.db-shm
+app.log*
+*.pem
+.DS_Store
+assets/icon.icns
+icon.iconset/
