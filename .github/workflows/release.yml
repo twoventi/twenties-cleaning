@@ -17,6 +17,11 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip pyinstaller
+      - name: Credenziali Google (dai secret, non dal codice)
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: python scripts/write_google_config.py
       - name: Build
         run: pyinstaller --noconfirm --onefile --windowed --name Twenties-Cleaning --icon assets/icon.ico src/twenties_cleaning.py
       - name: Smoke test (the built app must start and answer)
@@ -52,6 +57,11 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip pyinstaller
+      - name: Credenziali Google (dai secret, non dal codice)
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: python scripts/write_google_config.py
       - name: Make .icns icon
         run: |
           mkdir icon.iconset
@@ -105,3 +115,4 @@ jobs:
         with:
           files: out/*
           generate_release_notes: true
+        
