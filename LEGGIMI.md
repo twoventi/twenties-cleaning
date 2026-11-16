@@ -9,15 +9,15 @@
   Se usi Python di python.org e Google dà errore di certificati: esegui `Install Certificates.command` nella cartella Python.
 - **Windows**: doppio clic su `run_windows.bat`, oppure `python src\twenties_cleaning.py` (meglio come Amministratore).
 
-## Accesso con Google (facoltativo, non attivo nelle versioni ufficiali)
-1. Google Cloud Console → Credenziali → ID client OAuth → tipo "Applicazione web".
+## Accesso con Google (attivo nelle versioni ufficiali; qui sotto, se vuoi usare le tue credenziali)
+1. Google Cloud Console → Credenziali → ID client OAuth → tipo "Applicazione web" (o "App desktop").
 2. URI di reindirizzamento autorizzato: `http://127.0.0.1:8765/auth/google/callback` (con HTTPS: `https://...`).
 3. Crea il file `.env` nella cartella dati (Mac: `~/Library/Application Support/TwentiesCleaning/`, Windows: `%APPDATA%\TwentiesCleaning\`):
 ```
 GOOGLE_CLIENT_ID=...
 GOOGLE_CLIENT_SECRET=...
 ```
-Le chiavi restano solo sul server locale, mai nel browser né nel codice.
+Nelle versioni ufficiali le credenziali sono incorporate dalla build (dai secret di GitHub), non dal codice.
 
 ## Reset password
 Senza server di posta il link compare nel Terminale (solo se avvii da codice; nell'app scaricabile non è disponibile) (valido 15 minuti, monouso). Per l'email aggiungi a `.env`:

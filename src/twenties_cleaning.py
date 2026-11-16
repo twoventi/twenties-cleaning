@@ -8,6 +8,10 @@ import sqlite3, hmac, base64, ssl, smtplib, traceback, urllib.request, urllib.pa
 from email.message import EmailMessage
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+try:  # credenziali Google incorporate dalla build ufficiale (file generato da GitHub Actions, mai nel repository)
+    import _google_config as _GC
+except Exception:
+    _GC = None
 
 sys.setrecursionlimit(5000)
 GAME, JUNK, LOW, MID, HIGH = "Gioco", "Scarto", "Importanza bassa", "Importanza media", "Importanza elevata"
@@ -1519,7 +1523,8 @@ def main():
     d = data_dir()
     log_to_file(d)
     load_env(d)
-    G_ID, G_SECRET = os.environ.get("GOOGLE_CLIENT_ID", "").strip(), os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+    G_ID = (os.environ.get("GOOGLE_CLIENT_ID") or getattr(_GC, "CLIENT_ID", "") or "").strip()
+    G_SECRET = (os.environ.get("GOOGLE_CLIENT_SECRET") or getattr(_GC, "CLIENT_SECRET", "") or "").strip()
     init_db(os.path.join(d, "twenties.db"))
     DUMMY = hash_pw(secrets.token_hex(8))
     want = int(os.environ.get("TC_PORT", "8765") or 8765)
