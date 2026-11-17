@@ -575,7 +575,7 @@ def do_trash(paths):
 #  Account, sicurezza e server web (solo 127.0.0.1)
 # ====================================================================================
 APP = "Twenties Cleaning"
-VERSION = "1.1.0"
+VERSION = "1.0.3"
 HOST = "127.0.0.1"
 PLATFORM = "win" if IS_WIN else "mac" if IS_MAC else "linux"
 PORT, SCHEME, BASE, TLS_ON = 8765, "http", "", False

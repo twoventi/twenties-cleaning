@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.0
+## 1.0.3
 - L'app si apre in una finestra propria. Chiudendo la finestra il programma termina.
 - L'accesso con Google resta nel browser di sistema (Google non accetta il login dentro la finestra). Poi la finestra risulta già connessa.
 - Se la finestra non è disponibile, per esempio manca WebView2 su Windows, si apre il browser e compare un messaggio.
