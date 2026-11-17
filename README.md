@@ -2,18 +2,30 @@
 
 Vedi cosa pesa. Decidi tu.
 
-Programma per Windows e macOS. Mostra cartelle, file grandi, giochi, doppioni e archivi già estratti. Sposta nel Cestino solo quello che confermi. Si usa anche senza account.
+Programma per Windows e macOS. Mostra cartelle, file grandi, giochi, doppioni e archivi già estratti, e dice perché. Sposta nel Cestino solo quello che confermi. Si usa anche senza account.
 
-- Sito: https://twoventi.github.io/twenties-cleaning/
-- Download: https://github.com/twoventi/twenties-cleaning/releases/latest
+![Inizio](docs/assets/screen-home.png)
 
-## Aprire il file scaricato
+![Mappa](docs/assets/screen-map.png)
+
+## Download
+
+Versione 2.0.0: https://github.com/twoventi/twenties-cleaning/releases/latest
+
+- Windows: `Twenties-Windows.exe`
+- Mac (Intel e Apple Silicon, un file solo): `Twenties-macOS.dmg`
+
+Se il job Mac non parte, su GitHub esce comunque il file Windows.
+
+### Aprire il file
 
 Windows, se compare «Windows ha protetto il PC»: Ulteriori informazioni → Esegui comunque.
 
 Mac: tasto destro sull'app → Apri.
 
-Il controllo del file è in `SHA256SUMS`, accanto al download.
+### Controllare SHA256SUMS
+
+Accanto ai file c'è `SHA256SUMS`. Il numero deve coincidere.
 
 ```
 # Windows, PowerShell
@@ -23,31 +35,35 @@ Get-FileHash .\Twenties-Windows.exe -Algorithm SHA256
 shasum -a 256 Twenties-macOS.dmg
 ```
 
-Il numero deve coincidere con la riga di quel file in `SHA256SUMS`.
+## Avvio da sorgente
 
-## Per chi modifica il progetto
+Serve Python 3.8 o più recente. Dettagli in [LEGGIMI.md](LEGGIMI.md).
+
+```
+pip install -r requirements.txt
+python src/twenties_cleaning.py
+```
+
+Prova: `python tests/smoke_test.py`
+
+## Per chi pubblica
 
 ```
 python3 scripts/personalize.py --user TUO_UTENTE_GITHUB --repo twenties-cleaning --name "Nome Cognome" --email tua@email
 ```
 
-Poi push su `main`, GitHub Pages da `main` / `docs`, e un tag `v1.1.0` per la build. Escono `Twenties-Windows.exe` e, se il Mac di GitHub finisce in tempo, un `.dmg` solo (`Twenties-macOS.dmg`) con Intel e Apple Silicon insieme. Se il job Mac non parte, la release di Windows esce lo stesso.
+Push su `main`, GitHub Pages da `main` / `docs`, poi un tag `v2.0.0`. La build pubblica Windows anche se il Mac non finisce.
 
-```
-python3 tests/smoke_test.py
-python3 src/twenties_cleaning.py
-```
+Sito: https://twoventi.github.io/twenties-cleaning/
 
-Avvio da codice: [LEGGIMI.md](LEGGIMI.md). Licenza [MIT](LICENSE).
+Licenza [MIT](LICENSE).
 
 ---
 
 See what takes space. You decide.
 
-A program for Windows and macOS. It shows folders, large files, games, duplicates and archives you already extracted. It moves to the Trash only what you confirm. You can use it without an account.
+Windows and macOS. It shows what takes space and why, and moves to the Trash only what you confirm. No account required.
 
-On Windows, if you see “Windows protected your PC”: More info → Run anyway.
+Downloads are on the releases page: `Twenties-Windows.exe` and one `Twenties-macOS.dmg` for Intel and Apple Silicon. If the Mac build does not start, the Windows file is still published.
 
-On a Mac: right-click the app → Open.
-
-Check the file against `SHA256SUMS` (`Get-FileHash` on Windows, `shasum -a 256` on a Mac). The Mac download is one disk image for both Intel and Apple Silicon. If that build does not finish, the Windows release is still published.
+Windows, if you see “Windows protected your PC”: More info → Run anyway. Mac: right-click the app → Open. Check the file against `SHA256SUMS`.

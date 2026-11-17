@@ -91,7 +91,7 @@ try:
     check("versione più nuova segnalata", st == 200 and upd.get("consent") is True and upd.get("update") is True and upd.get("latest") == "9.9.9")
     open(FIXTURE, "w", encoding="utf-8").write(json.dumps({"tag_name": "v0.0.1", "html_url": "https://github.com/twoventi/twenties-cleaning/releases/tag/v0.0.1"}))
     st, upd = req("POST", "/api/update_check", {}, csrf)
-    check("versione più vecchia ignorata", st == 200 and upd.get("update") is False and upd.get("current") == "1.1.0")
+    check("versione più vecchia ignorata", st == 200 and upd.get("update") is False and upd.get("current") == "2.0.0")
     st, _ = req("POST", "/api/settings", {"updates": False}, csrf)
     scan_root = os.path.join(tmp, "OneDrive")
     accent = os.path.join(scan_root, "Cartella èà")
@@ -124,7 +124,7 @@ try:
     csrf = r["csrf"]
     check("sessione chiusa dopo l'eliminazione", req("GET", "/api/me")[1]["user"] is None)
     check("accesso impossibile dopo l'eliminazione", req("POST", "/api/login", {"email": "prova@example.com", "password": "correct-horse-9"}, csrf)[0] == 401)
-    check("modalità senza finestra", me.get("app") == "Twenties" and me.get("version") == "1.1.0" and me.get("window") is False)
+    check("modalità senza finestra", me.get("app") == "Twenties" and me.get("version") == "2.0.0" and me.get("window") is False)
     c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
     c.request("GET", "/auth/finish?t=not-a-real-ticket", headers={"Host": f"127.0.0.1:{PORT}"})
     rr = c.getresponse(); loc = rr.getheader("Location") or ""; rr.read()
