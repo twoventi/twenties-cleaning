@@ -1,6 +1,7 @@
 # Changelog
 
 ## 1.1.0
+- Testi più corti. Il Mac è un solo file per Intel e Apple Silicon.
 - Il nome nell'app, nella finestra e nei file scaricabili è Twenties. Il repository e la cartella dati restano quelli di prima, così un account già creato non si perde.
 - Si usa subito, anche senza account. L'account locale o Google è facoltativo.
 - Mappa delle cartelle analizzate, ad anelli o a riquadri, con il perché dell'etichetta. Si può aprire la cartella o spostarla nel Cestino, dopo una conferma.
