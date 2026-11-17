@@ -602,10 +602,17 @@ START_LOCK = threading.Lock()
 
 
 def quiet_streams():
-    """In un'app senza terminale (PyInstaller --windowed su Windows) stdout/stderr sono None: print() andrebbe in errore."""
+    """In un'app senza terminale (PyInstaller --windowed su Windows) stdout/stderr sono None: print() andrebbe in errore.
+    I messaggi sono in italiano: forzo UTF-8, altrimenti su Windows la console (cp1252) storpia le lettere accentate."""
     for n in ("stdout", "stderr"):
-        if getattr(sys, n) is None:
-            setattr(sys, n, open(os.devnull, "w"))
+        stream = getattr(sys, n)
+        if stream is None:
+            setattr(sys, n, open(os.devnull, "w", encoding="utf-8"))
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 
 def log_to_file(d):

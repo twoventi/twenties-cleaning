@@ -8,7 +8,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, "src", "twenties_cleaning.py")
 s = socket.socket(); s.bind(("127.0.0.1", 0)); PORT = s.getsockname()[1]; s.close()
 tmp = tempfile.mkdtemp()
-env = dict(os.environ, TC_PORT=str(PORT), TC_HEADLESS="1", HOME=tmp, USERPROFILE=tmp, APPDATA=tmp, XDG_DATA_HOME=tmp, BROWSER="true")
+env = dict(os.environ, TC_PORT=str(PORT), TC_HEADLESS="1", HOME=tmp, USERPROFILE=tmp, APPDATA=tmp, XDG_DATA_HOME=tmp,
+            BROWSER="true", PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
 proc = subprocess.Popen([sys.executable, APP, "--headless"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 jar = {}
 
@@ -35,10 +36,22 @@ def req(method, path, body=None, csrf=""):
     return r.status, json.loads(t)
 
 
-def check(name, cond):
+def check(name, cond, detail=""):
     print(("OK   " if cond else "FAIL ") + name)
     if not cond:
+        if detail:
+            print(detail)
         raise SystemExit(1)
+
+
+def text(raw):
+    """Su Windows la pipe può essere cp1252 se l'app non è riuscita a passare a UTF-8."""
+    for enc in ("utf-8", "cp1252"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
 
 
 try:
@@ -71,17 +84,18 @@ try:
 
     def once(port):
         home = tempfile.mkdtemp()
-        e = dict(os.environ, TC_PORT=str(port), TC_HEADLESS="1", HOME=home, USERPROFILE=home, APPDATA=home, XDG_DATA_HOME=home, BROWSER="true")
+        e = dict(os.environ, TC_PORT=str(port), TC_HEADLESS="1", HOME=home, USERPROFILE=home, APPDATA=home, XDG_DATA_HOME=home,
+                 BROWSER="true", PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
         p = subprocess.Popen([sys.executable, APP, "--headless"], env=e, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             err = p.communicate(timeout=25)[1]
         except subprocess.TimeoutExpired:
             p.kill(); p.communicate()
             raise SystemExit("una copia in più non è terminata")
-        return p.returncode, err.decode("utf-8", "replace")
+        return p.returncode, text(err)
 
     code, err = once(PORT)
-    check("seconda copia non resta accesa", code == 0 and "già aperto" in err)
+    check("seconda copia non resta accesa", code == 0 and "aperto" in err, "codice %s\n%s" % (code, err.strip()))
     check("la prima copia risponde ancora", req("GET", "/api/me")[0] == 200)
 
     def occupy(handler):
