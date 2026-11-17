@@ -587,6 +587,8 @@ PWSEM = threading.BoundedSemaphore(4)
 DBL, CON = threading.Lock(), None
 G_ID = G_SECRET = ""
 OAUTH, OAL = {}, threading.Lock()
+HANDOFF, WINDOW, WINDOW_MODE = {}, None, False  # passaggio dell'accesso Google dal browser alla finestra dell'app
+DONE_PAGE = '<!doctype html><meta charset="utf-8"><title>Twenties Cleaning</title><body><h2>%s</h2><p>%s</p></body>'
 TOKRE, PRERE = re.compile(r"[A-Za-z0-9_-]{43}"), re.compile(r"[A-Za-z0-9_-]{32}")
 EMAIL_RE = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
                       r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+")
@@ -960,8 +962,16 @@ class H(BaseHTTPRequestHandler):
                 return self.jout({"user": {"email": s["email"], "name": s["name"]} if s else None, "csrf": csrf_for(b),
                                   "google": bool(G_ID and G_SECRET), "mail": bool(os.environ.get("SMTP_HOST")),
                                   "platform": PLATFORM}, cookies=ck)
+            if p == "/api/focus":  # una seconda copia dell'app chiede di riportare in primo piano la finestra già aperta
+                if WINDOW is not None:
+                    for fn in ("restore", "show"):
+                        try:
+                            getattr(WINDOW, fn)()
+                        except Exception:
+                            pass
+                return self.jout({"app": APP, "window": WINDOW_MODE})
             if p == "/auth/google":
-                return self.google_start(ip)
+                return self.google_start(ip, (qs.get("t") or [""])[0])
             if p == "/auth/google/callback":
                 return self.google_cb(qs)
             if p in ("/api/drives", "/api/status", "/api/results"):
@@ -981,7 +991,7 @@ class H(BaseHTTPRequestHandler):
             self.err(500, "Errore interno")
 
     # ---------- Google
-    def google_start(self, ip):
+    def google_start(self, ip, ticket=""):
         if not (G_ID and G_SECRET):
             return self.redirect("/?e=google_off")
         if RL.count("g:" + ip, 600) >= 20:
@@ -994,7 +1004,7 @@ class H(BaseHTTPRequestHandler):
                 del OAUTH[k]
             if len(OAUTH) > 200:
                 OAUTH.clear()
-            OAUTH[st] = (ver, nonce, pre, now + 600)
+            OAUTH[st] = (ver, nonce, pre, now + 600, ticket if (WINDOW_MODE and ticket in HANDOFF) else "")
         ch = base64.urlsafe_b64encode(hashlib.sha256(ver.encode()).digest()).rstrip(b"=").decode()
         q = urllib.parse.urlencode({"client_id": G_ID, "redirect_uri": f"{BASE}/auth/google/callback", "response_type": "code",
                                     "scope": "openid email profile", "state": st, "nonce": nonce, "code_challenge": ch,
@@ -1005,20 +1015,62 @@ class H(BaseHTTPRequestHandler):
         st, code = (qs.get("state") or [""])[0], (qs.get("code") or [""])[0]
         with OAL:
             ent = OAUTH.pop(st, None)
-        if not ent or ent[3] < time.time() or not self.pre() or not eq(ent[2], self.pre()) or qs.get("error") or not code or len(code) > 2048:
+        tk = ent[4] if ent and len(ent) > 4 else ""
+
+        def fail():
+            if tk and tk in HANDOFF:
+                HANDOFF[tk] = ["fail", time.time() + 300]
+                return self.send(200, DONE_PAGE % ("Accesso non riuscito", "Torna a Twenties Cleaning e riprova."), "text/html")
             return self.redirect("/?e=google_fail")
+        if not ent or ent[3] < time.time() or not self.pre() or not eq(ent[2], self.pre()) or qs.get("error") or not code or len(code) > 2048:
+            return fail()
         try:
             uid = google_user(google_exchange(code, ent[0], ent[1]))
         except Exception as e:
             print("Accesso Google non riuscito:", type(e).__name__)
             if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
                 print("Certificati SSL mancanti. Su Mac con Python di python.org esegui 'Install Certificates.command'.")
-            return self.redirect("/?e=google_fail")
+            return fail()
         old = self.session()
         if old:
             dbx("DELETE FROM sessions WHERE id=?", (old["sid"],))
         tok, _ = new_session(uid)
+        if tk and tk in HANDOFF:  # app a finestra: la sessione passa alla finestra, non resta nel browser
+            HANDOFF[tk] = [tok, time.time() + 120]
+            return self.send(200, DONE_PAGE % ("Accesso completato", "Puoi chiudere questa scheda e tornare a Twenties Cleaning."), "text/html")
         self.redirect("/", [self.mk(SN, tok)])
+
+    def p_gbegin(self, d, ip):
+        if not (G_ID and G_SECRET):
+            return self.err(400, "Accesso con Google non disponibile")
+        if not WINDOW_MODE:
+            return self.jout({"same": True})
+        now = time.time()
+        for k in [k for k, v in HANDOFF.items() if v[1] < now]:
+            del HANDOFF[k]
+        if len(HANDOFF) > 20:
+            HANDOFF.clear()
+        tk = secrets.token_urlsafe(24)
+        HANDOFF[tk] = [None, now + 300]
+        try:
+            webbrowser.open(f"{BASE}/auth/google?t={tk}")
+        except Exception:
+            return self.err(500, "Non riesco ad aprire il browser")
+        self.jout({"ticket": tk})
+
+    def p_gpoll(self, d, ip):
+        tk = str(d.get("ticket", ""))[:64]
+        v = HANDOFF.get(tk)
+        if not v or v[1] < time.time():
+            HANDOFF.pop(tk, None)
+            return self.err(410, "Accesso scaduto")
+        if v[0] == "fail":
+            HANDOFF.pop(tk, None)
+            return self.err(400, "Accesso non riuscito")
+        if v[0]:
+            HANDOFF.pop(tk, None)
+            return self.jout({"ok": True}, cookies=[self.mk(SN, v[0])])
+        self.jout({"wait": True})
 
     # ---------- POST
     def do_POST(self):
@@ -1037,7 +1089,8 @@ class H(BaseHTTPRequestHandler):
             b = self.binding()
             if not b or not eq(self.headers.get("X-CSRF-Token", ""), csrf_for(b)):
                 return self.err(403, "Sessione di sicurezza non valida: ricarica la pagina")
-            pub = {"/api/register": self.p_register, "/api/login": self.p_login, "/api/forgot": self.p_forgot, "/api/reset": self.p_reset}
+            pub = {"/api/register": self.p_register, "/api/login": self.p_login, "/api/forgot": self.p_forgot, "/api/reset": self.p_reset,
+                   "/api/google_begin": self.p_gbegin, "/api/google_poll": self.p_gpoll}
             if p in pub:
                 if RL.count("pub:" + ip, 60) >= 60:
                     return self.err(429, "Troppe richieste. Riprova tra poco.", headers=[("Retry-After", "60")])
@@ -1209,6 +1262,8 @@ class H(BaseHTTPRequestHandler):
 
     def p_quit(self, d, s):
         self.jout({})
+        if WINDOW is not None:
+            threading.Thread(target=WINDOW.destroy, daemon=True).start()
         threading.Thread(target=self.server.shutdown, daemon=True).start()
 
 
@@ -1347,6 +1402,14 @@ async function api(u,b){
  if(j&&typeof j==="object")j._s=r.status;
  if(r.status===401&&ME&&u!=="/api/login"){ME=null;stopPoll();showAuth("login");toast("Sessione scaduta. Accedi di nuovo.")}
  return j}
+async function googleGo(){const r=await api("/api/google_begin",{});
+ if(!r||r.error){toast(r&&r.error?r.error:"Accesso con Google non disponibile");return}
+ if(r.same){location.href="/auth/google";return}
+ toast("Completa l'accesso nel browser, poi torna qui…",180000);
+ for(let i=0;i<90;i++){await new Promise(z=>setTimeout(z,2000));const q=await api("/api/google_poll",{ticket:r.ticket});
+  if(q&&q.ok){location.reload();return}
+  if(q&&q.error){toast("Accesso con Google non riuscito. Riprova.");return}}
+ toast("Tempo scaduto. Riprova.")}
 function ask(title,body,ok){return new Promise(res=>{const m=$("#modal");m.innerHTML=`<div class=sheet role=dialog aria-modal=true><h3>${esc(title)}</h3><p>${esc(body)}</p><div class=sb><button class=btn data-m=0>Annulla</button><button class=pri data-m=1>${esc(ok)}</button></div></div>`;m.hidden=false;const done=v=>{m.hidden=true;m.innerHTML="";m.onclick=null;res(v)};m.onclick=e=>{const b=e.target.closest("[data-m]");if(b)done(b.dataset.m==="1");else if(e.target===m)done(false)};m.querySelector(".pri").focus()})}
 /* intro */
 let si=0;const SL=[...document.querySelectorAll(".slide")];
@@ -1447,7 +1510,7 @@ document.addEventListener("click",async e=>{
  const g=id=>e.target.closest(id),p=g("[data-p]"),f=g("[data-f]"),t=g("[data-t]"),o=g("[data-go]"),am=g("[data-am]");
  if(am){e.preventDefault();return showAuth(am.dataset.am)}
  if(g("#reintro")){e.preventDefault();$("#auth").hidden=true;$("#intro").hidden=false;slide(0)}
- if(g("#gg")&&GOOGLE){location.href="/auth/google"}
+ if(g("#gg")&&GOOGLE){googleGo()}
  if(p)api("/api/reveal",{path:p.dataset.p});
  if(f){filt=f.dataset.f;render()}
  if(t){tab=t.dataset.t;q="";render()}
@@ -1506,6 +1569,7 @@ $("#go").onclick=async()=>{
 
 
 def main():
+    global WINDOW, WINDOW_MODE
     global PORT, SCHEME, BASE, TLS_ON, SN, PN, G_ID, G_SECRET, DUMMY
     quiet_streams()
     if sys.version_info < (3, 8):
@@ -1531,6 +1595,15 @@ def main():
     try:
         srv = ThreadingHTTPServer((HOST, want), H)
     except OSError:
+        try:  # già aperta? Riporto in primo piano quella, invece di aprirne un'altra
+            with urllib.request.urlopen(f"http://{HOST}:{want}/api/focus", timeout=3) as r0:
+                j0 = json.loads(r0.read())
+            if j0.get("app") == APP:
+                if not j0.get("window"):
+                    webbrowser.open(f"http://{HOST}:{want}/")
+                return
+        except Exception:
+            pass
         if G_ID:
             sys.exit(f"La porta {want} è occupata (serve fissa per l'accesso con Google). Chiudi l'altra copia o imposta TC_PORT.")
         srv = ThreadingHTTPServer((HOST, 0), H)
@@ -1549,12 +1622,33 @@ def main():
     print("Sicurezza: " + ("HTTPS attivo." if TLS_ON else "connessione solo locale (127.0.0.1, nulla esce dal computer). Per HTTPS vedi LEGGIMI."))
     print("Accesso con Google: " + ("attivo." if G_ID and G_SECRET else "non configurato (vedi LEGGIMI)."))
     print("Tieni aperta questa finestra; per uscire usa il pulsante Esci o premi Ctrl+C.")
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    if not os.environ.get("TC_HEADLESS") and not os.environ.get("TC_BROWSER"):
+        t0 = time.time()
+        try:
+            import webview
+            try:
+                webview.settings["ALLOW_DOWNLOADS"] = True
+            except Exception:
+                pass
+            WINDOW = webview.create_window(APP, BASE + "/", width=1180, height=800, min_size=(820, 600))
+            WINDOW_MODE = True
+            webview.start(private_mode=False, storage_path=os.path.join(d, "webview"))
+            if time.time() - t0 > 3:  # chiusa dall'utente: esco
+                srv.shutdown()
+                return
+            print("La finestra si è chiusa subito: uso il browser.")
+        except Exception as e:
+            print("Finestra non disponibile, uso il browser:", type(e).__name__, e)
+        WINDOW, WINDOW_MODE = None, False
     try:
         webbrowser.open(BASE + "/")
     except Exception:
         pass
     try:
-        srv.serve_forever()
+        while th.is_alive():
+            th.join(0.5)
     except KeyboardInterrupt:
         pass
 
