@@ -23,13 +23,13 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: python scripts/write_google_config.py
       - name: Build
-        run: pyinstaller --noconfirm --onefile --windowed --name Twenties-Cleaning --icon assets/icon.ico --add-data "assets/icon.ico;assets" --add-data "assets/icon.png;assets" --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr --hidden-import bottle --hidden-import proxy_tools --hidden-import webview --hidden-import webview.platforms.edgechromium --hidden-import webview.platforms.winforms src/twenties_cleaning.py
+        run: pyinstaller --noconfirm --onefile --windowed --name Twenties --icon assets/icon.ico --add-data "assets/icon.ico;assets" --add-data "assets/icon.png;assets" --add-data "assets/logo.svg;assets" --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr --hidden-import bottle --hidden-import proxy_tools --hidden-import webview --hidden-import webview.platforms.edgechromium --hidden-import webview.platforms.winforms src/twenties_cleaning.py
       - name: Smoke test (the built app must start and answer)
         shell: pwsh
         run: |
           $env:TC_PORT = "8795"
           $env:TC_HEADLESS = "1"
-          $p = Start-Process -FilePath "dist/Twenties-Cleaning.exe" -PassThru
+          $p = Start-Process -FilePath "dist/Twenties.exe" -PassThru
           $ok = $false
           foreach ($i in 1..30) {
             Start-Sleep -Seconds 2
@@ -37,11 +37,11 @@ jobs:
           }
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           if (-not $ok) { throw "Smoke test failed: the app did not answer" }
-      - run: Move-Item dist/Twenties-Cleaning.exe Twenties-Cleaning-Windows.exe
+      - run: Move-Item dist/Twenties.exe Twenties-Windows.exe
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: Twenties-Cleaning-Windows.exe
+          path: Twenties-Windows.exe
 
   intel:
     runs-on: macos-15-intel
@@ -67,15 +67,15 @@ jobs:
           done
           iconutil -c icns icon.iconset -o assets/icon.icns
       - name: Build
-        run: pyinstaller --noconfirm --windowed --name "Twenties Cleaning" --icon assets/icon.icns --osx-bundle-identifier "io.github.${{ github.repository_owner }}.twentiescleaning" --add-data "assets/icon.png:assets" --add-data "assets/icon.icns:assets" --collect-all webview --hidden-import objc --hidden-import AppKit --hidden-import Foundation --hidden-import WebKit --hidden-import UniformTypeIdentifiers --hidden-import PyObjCTools.AppHelper --hidden-import bottle --hidden-import proxy_tools --hidden-import webview src/twenties_cleaning.py
+        run: pyinstaller --noconfirm --windowed --name "Twenties" --icon assets/icon.icns --osx-bundle-identifier "io.github.${{ github.repository_owner }}.twentiescleaning" --add-data "assets/icon.png:assets" --add-data "assets/icon.icns:assets" --add-data "assets/logo.svg:assets" --collect-all webview --hidden-import objc --hidden-import AppKit --hidden-import Foundation --hidden-import WebKit --hidden-import UniformTypeIdentifiers --hidden-import PyObjCTools.AppHelper --hidden-import bottle --hidden-import proxy_tools --hidden-import webview src/twenties_cleaning.py
       - name: Finder permission text and ad-hoc signature
         run: |
-          /usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string Twenties Cleaning usa Finder solo per spostare nel Cestino i file che scegli." "dist/Twenties Cleaning.app/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" -c "Add :NSAppTransportSecurity:NSAllowsLocalNetworking bool true" "dist/Twenties Cleaning.app/Contents/Info.plist"
-          codesign --force --deep --sign - "dist/Twenties Cleaning.app"
+          /usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string Twenties usa Finder solo per spostare nel Cestino i file che scegli." "dist/Twenties.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" -c "Add :NSAppTransportSecurity:NSAllowsLocalNetworking bool true" "dist/Twenties.app/Contents/Info.plist"
+          codesign --force --deep --sign - "dist/Twenties.app"
       - name: Smoke test (the built app must start and answer)
         run: |
-          TC_HEADLESS=1 TC_PORT=8795 "dist/Twenties Cleaning.app/Contents/MacOS/Twenties Cleaning" &
+          TC_HEADLESS=1 TC_PORT=8795 "dist/Twenties.app/Contents/MacOS/Twenties" &
           APP_PID=$!
           ok=0
           for i in $(seq 1 30); do
@@ -87,13 +87,13 @@ jobs:
       - name: Make .dmg
         run: |
           mkdir dmg
-          cp -R "dist/Twenties Cleaning.app" dmg/
+          cp -R "dist/Twenties.app" dmg/
           ln -s /Applications dmg/Applications
-          hdiutil create -volname "Twenties Cleaning" -srcfolder dmg -ov -format UDZO "Twenties-Cleaning-macOS-${MAC_SUFFIX}.dmg"
+          hdiutil create -volname "Twenties" -srcfolder dmg -ov -format UDZO "Twenties-macOS-${MAC_SUFFIX}.dmg"
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ env.MAC_SUFFIX }}
-          path: Twenties-Cleaning-macOS-${{ env.MAC_SUFFIX }}.dmg
+          path: Twenties-macOS-${{ env.MAC_SUFFIX }}.dmg
       - name: Aggiungi il dmg Apple Silicon alla release
         if: success() && env.MAC_SUFFIX == 'AppleSilicon' && startsWith(github.ref, 'refs/tags/v')
         env:
@@ -101,7 +101,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          file="Twenties-Cleaning-macOS-AppleSilicon.dmg"
+          file="Twenties-macOS-AppleSilicon.dmg"
           if command -v sha256sum >/dev/null 2>&1; then
             sum="$(sha256sum "$file")"
           else
@@ -109,7 +109,7 @@ jobs:
           fi
           merge_sums() {
             if [ -f SHA256SUMS ]; then
-              grep -v 'Twenties-Cleaning-macOS-AppleSilicon.dmg' SHA256SUMS > SHA256SUMS.new || true
+              grep -v 'Twenties-macOS-AppleSilicon.dmg' SHA256SUMS > SHA256SUMS.new || true
             else
               : > SHA256SUMS.new
             fi
@@ -166,7 +166,7 @@ jobs:
       - name: Checksums
         run: |
           cd out
-          sha256sum Twenties-Cleaning-* > SHA256SUMS
+          sha256sum Twenties-* > SHA256SUMS
           ls -l
       - uses: softprops/action-gh-release@v2
         with:

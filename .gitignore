@@ -11,5 +11,4 @@ dist/
 app.log*
 *.pem
 .DS_Store
-assets/icon.icns
 icon.iconset/

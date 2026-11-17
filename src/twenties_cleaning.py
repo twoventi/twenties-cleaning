@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Twenties Cleaning - analizza lo spazio del PC / Mac: cartelle, giochi, doppioni, archivi gia' estratti.
-Python 3.8+ e pywebview per la finestra (se manca, si apre il browser). Elimina solo su tua conferma e solo verso il Cestino.
-Avvio:  python3 src/twenties_cleaning.py   -> finestra dell'app (accesso con account).
+"""Twenties - mostra cosa pesa sul PC / Mac e lascia decidere a te.
+Python 3.8+ e pywebview per la finestra (se manca, si apre il browser). Sposta solo su tua conferma e solo nel Cestino.
+Avvio:  python3 src/twenties_cleaning.py   -> finestra dell'app, usabile anche senza account.
 Windows, macOS e Linux. Vedi LEGGIMI per Google, HTTPS e posta."""
 import os, re, sys, json, time, stat, heapq, string, shutil, zipfile, tarfile, hashlib, secrets, threading, subprocess, webbrowser
 import errno, socket, sqlite3, hmac, base64, ssl, smtplib, traceback, urllib.request, urllib.parse, urllib.error
@@ -74,8 +74,28 @@ def marker_root(d):
     return r if os.path.dirname(r) != r else d
 
 
+def launcher_info(path):
+    """Quale launcher, se il percorso lo dice. Il link apre la libreria, non un gioco preciso."""
+    low = path.replace("\\", "/").lower()
+    rules = (
+        ("steamapps/common", "Steam", "https://store.steampowered.com/"),
+        ("epic games", "Epic", "https://store.epicgames.com/"),
+        ("gog galaxy/games", "GOG Galaxy", "https://www.gog.com/account"),
+        ("gog games", "GOG", "https://www.gog.com/account"),
+        ("riot games", "Riot", "https://www.riotgames.com/"),
+        ("ubisoft game launcher/games", "Ubisoft", "https://ubisoftconnect.com/"),
+        ("ea games", "EA", "https://www.ea.com/ea-app"),
+        ("origin games", "EA", "https://www.ea.com/ea-app"),
+        ("xboxgames", "Xbox", "https://www.xbox.com/play"),
+    )
+    for needle, name, url in rules:
+        if needle in low:
+            return name, url
+    return "", ""
+
+
 def walk(roots, minb):
-    dirs, markers, sizes, top, archs, n = {}, set(), {}, [], [], 0
+    dirs, markers, sizes, top, archs, junk, n = {}, set(), {}, [], [], [], 0
     stack = list(roots)
     while stack and not S["stop"]:
         d = stack.pop()
@@ -84,7 +104,7 @@ def walk(roots, minb):
         except OSError:
             S["denied"] += 1
             continue
-        st, names, subs = [0, 0, 0, 0, 0, 0, 0], set(), set()
+        st, names, subs = [0, 0, 0, 0, 0, 0, 0, 0], set(), set()
         nodup = d.lower().startswith(SYS)
         with it:
             for e in it:
@@ -109,6 +129,13 @@ def walk(roots, minb):
                         archs.append((e.path, sz, s.st_mtime))
                     st[6] += 1
                     st[5] = max(st[5], s.st_mtime)
+                    at = getattr(s, "st_atime", 0) or 0
+                    if at > st[7]:
+                        st[7] = at
+                    if not nodup and len(junk) < 2000 and sz > 0:
+                        parent = set(re.split(r"[\\/]", d.lower()))
+                        if ext in JUNK_EXT or (parent & JUNK_DIRS) or (ext in INSTALLER_EXT and parent & {"downloads", "download"}):
+                            junk.append({"path": e.path, "name": e.name, "size": sz, "mtime": s.st_mtime})
                     names.add(nm)
                     n += 1
                     item = (sz, e.path, s.st_mtime)
@@ -124,7 +151,7 @@ def walk(roots, minb):
         if names & GAME_FILES or subs & GAME_DIRS:
             markers.add(marker_root(d))
         S["count"], S["current"] = n, d
-    return dirs, markers, sizes, top, archs
+    return dirs, markers, sizes, top, archs, junk
 
 
 def special(p):
@@ -166,8 +193,12 @@ def report(p, out, tot, kids):
     spread = size - sum(s for s, c in sub if s >= MINFOLDER)
     if sp or ((not big or spread >= .4 * size) and p not in C["anc"]):
         cat, why = sp or by_content(p, t)
-        out.append({"path": p, "name": os.path.basename(p) or p, "size": size, "files": t[6], "mtime": t[5],
-                    "cat": cat, "why": why})
+        rec = {"path": p, "name": os.path.basename(p) or p, "size": size, "files": t[6], "mtime": t[5],
+               "atime": t[7] if len(t) > 7 else 0, "cat": cat, "why": why}
+        if cat == GAME:
+            ln, lu = launcher_info(p)
+            rec["launcher"], rec["launcher_url"] = ln, lu
+        out.append(rec)
     else:
         for c in big:
             report(c, out, tot, kids)
@@ -200,7 +231,46 @@ def fclass(path, mtime):
     return (LOW, "tipo sconosciuto, non modificato da 2+ anni") if old else (MID, "tipo sconosciuto, usato di recente")
 
 
-def build(dirs, markers, top):
+def map_tree(tot, kids):
+    """Albero per la mappa. Limita profondità e figli così il disegno resta leggibile."""
+    roots = [p for p in tot if os.path.dirname(p) == p or os.path.dirname(p) not in tot]
+    allow, sizes, budget = set(), {}, [1200]
+
+    def node(p, depth):
+        if budget[0] <= 0 or p not in tot:
+            return None
+        t = tot[p]
+        size = sum(t[:5])
+        if size <= 0 and depth:
+            return None
+        budget[0] -= 1
+        sp = special(p)
+        cat, why = sp or by_content(p, t)
+        children = []
+        if depth < 5:
+            subs = []
+            for c in kids.get(p, ()):
+                if c in tot:
+                    subs.append((sum(tot[c][:5]), c))
+            subs = [(s, c) for s, c in sorted(subs, reverse=True) if s > 0][:18]
+            for _s, c in subs:
+                n = node(c, depth + 1)
+                if n:
+                    children.append(n)
+        allow.add(p)
+        sizes[p] = size
+        return {"name": os.path.basename(p) or p, "path": p, "size": size, "cat": cat, "why": why,
+                "mtime": t[5], "atime": t[7] if len(t) > 7 else 0, "children": children}
+
+    out = []
+    for r in roots:
+        n = node(r, 0)
+        if n:
+            out.append(n)
+    return out, allow, sizes
+
+
+def build(dirs, markers, top, junk=None):
     tot, kids = {p: list(v) for p, v in dirs.items()}, {}
     for p in sorted(dirs, key=lambda x: x.count(os.sep), reverse=True):
         par = os.path.dirname(p)
@@ -210,6 +280,7 @@ def build(dirs, markers, top):
             for i in (0, 1, 2, 3, 4, 6):
                 a[i] += b[i]
             a[5] = max(a[5], b[5])
+            a[7] = max(a[7], b[7])
     groots = set(markers)
     for d in dirs:
         m = GAME_RE.match(d)
@@ -229,6 +300,9 @@ def build(dirs, markers, top):
     for r in [p for p in tot if os.path.dirname(p) == p or os.path.dirname(p) not in tot]:
         report(r, folders, tot, kids)
     folders = sorted(folders, key=lambda x: -x["size"])[:300]
+    tree, allow, dirsize = map_tree(tot, kids)
+    C["dirs"], C["dirsize"] = allow, dirsize
+    C["map_roots"] = {n["path"] for n in tree}
     files = []
     for sz, p, m in sorted(top, reverse=True):
         c, w = fclass(p, m)
@@ -236,7 +310,19 @@ def build(dirs, markers, top):
     totals = {}
     for f in folders:
         totals[f["cat"]] = totals.get(f["cat"], 0) + f["size"]
-    return {"folders": folders, "files": files, "totals": totals}
+    junk = list(junk or [])
+    covered = [f["path"] for f in folders if f["cat"] == JUNK]
+    extra = []
+    for j in junk:
+        jp = j["path"]
+        if not any(jp == c or jp.startswith(c + os.sep) for c in covered):
+            extra.append(j)
+    scarto_folders = sum(f["size"] for f in folders if f["cat"] == JUNK)
+    scarto_files = sum(j["size"] for j in extra)
+    return {"folders": folders, "files": files, "totals": totals, "map": tree,
+            "games": [f for f in folders if f["cat"] == GAME],
+            "junk_files": junk, "scarto_extra": extra,
+            "scarto_total": scarto_folders + scarto_files}
 
 
 def hsh(path, size, full):
@@ -283,7 +369,8 @@ def find_dups(sizes):
                 if len(h) > 1:
                     ps = sorted(h)
                     mt = [os.path.getmtime(x) if os.path.exists(x) else 0 for x in ps]
-                    res.append({"size": sz, "paths": ps, "mt": mt, "wasted": sz * (len(h) - 1)})
+                    res.append({"size": sz, "paths": ps, "mt": mt, "wasted": sz * (len(h) - 1),
+                                "hash": "blake2b", "exact": True})
     return sorted(res, key=lambda g: -g["wasted"])[:300]
 
 
@@ -423,9 +510,9 @@ def find_archives(archs):
         if ents:
             ratio, where, n = verify(ents, bases)
             if ratio >= .98:
-                lvl, why = "ok", f"Tutti i {n} file dell'archivio sono già presenti in: {where}"
+                lvl, why, code = "ok", f"Tutti i {n} file dell'archivio sono già presenti in: {where}", "arch.ok"
             elif ratio >= .6:
-                lvl, why = "part", f"Estratto solo in parte ({ratio:.0%}) in: {where}. Controlla prima di eliminare"
+                lvl, why, code = "part", f"Estratto solo in parte ({ratio:.0%}) in: {where}. Controlla prima di eliminare", "arch.part"
             else:
                 continue
         elif nm.lower().endswith((".rar", ".7z", ".zip")) and os.path.isdir(bases[1]):
@@ -435,20 +522,21 @@ def find_archives(archs):
                         continue
             except OSError:
                 continue
-            lvl, n, where = "guess", 0, bases[1]
+            lvl, n, where, code = "guess", 0, bases[1], "arch.guess"
             why = "Esiste una cartella con lo stesso nome, ma non riesco a leggere l'archivio (installa 7-Zip o WinRAR): verifica a mano"
         else:
             continue
         out.append({"path": p, "name": nm, "size": sum(v[1] for v in vols), "vols": vols, "level": lvl, "why": why,
+                    "why_code": code, "why_n": n, "why_where": where, "why_ratio": round(ratio, 2) if ents else None,
                     "where": where, "files": n, "mtime": mt})
     return sorted(out, key=lambda a: (a["level"] != "ok", -a["size"]))
 
 
 def run(roots, dups, arch, minmb):
     try:
-        dirs, markers, sizes, top, archs = walk(roots, minmb << 20)
+        dirs, markers, sizes, top, archs, junk = walk(roots, minmb << 20)
         S["phase"] = "agg"
-        res = build(dirs, markers, top)
+        res = build(dirs, markers, top, junk)
         res["dups"] = find_dups(sizes) if dups and not S["stop"] else []
         res["wasted"] = sum(g["wasted"] for g in res["dups"])
         res["archives"] = find_archives(archs) if arch and not S["stop"] else []
@@ -503,70 +591,146 @@ def reveal(p):
 
 
 def trash_many(paths):
-    """Sposta nel Cestino (recuperabile). Se il Cestino non e' disponibile NON elimina nulla."""
-    if not paths:
+    """Sposta nel Cestino (recuperabile). Se il Cestino non e' disponibile NON elimina nulla.
+    File e cartelle. I percorsi restano Unicode: su Windows il JSON entra in UTF-8."""
+    files = [p for p in paths if os.path.isfile(p) and not os.path.islink(p)]
+    dirs = [p for p in paths if os.path.isdir(p) and not os.path.islink(p)]
+    if not files and not dirs:
         return
     try:
         if IS_WIN:
-            ps = ("Add-Type -AssemblyName Microsoft.VisualBasic;$i=[Console]::In.ReadToEnd()|ConvertFrom-Json;"
-                  "foreach($p in $i){try{[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p,'OnlyErrorDialogs','SendToRecycleBin')}catch{}}")
+            ps = ("[Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false;"
+                  "$i=[Console]::In.ReadToEnd()|ConvertFrom-Json;Add-Type -AssemblyName Microsoft.VisualBasic;"
+                  "foreach($p in @($i.files)){try{[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile([string]$p,'OnlyErrorDialogs','SendToRecycleBin')}catch{}};"
+                  "foreach($p in @($i.dirs)){try{[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory([string]$p,'OnlyErrorDialogs','SendToRecycleBin')}catch{}}")
+            raw = json.dumps({"files": files, "dirs": dirs}, ensure_ascii=False).encode("utf-8")
             subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
-                           input=json.dumps(paths).encode(), capture_output=True, timeout=900, **NW)
+                           input=b"\xef\xbb\xbf" + raw, capture_output=True, timeout=900, **NW)
         elif IS_MAC:
             scr = ['on run argv', 'tell application "Finder" to delete (POSIX file (item 1 of argv) as alias)', 'end run']
-            for p in paths:
+            for p in files + dirs:
                 subprocess.run(["osascript"] + [x for l in scr for x in ("-e", l)] + [p], capture_output=True, timeout=120)
         else:
             exe = shutil.which("gio") and ["gio", "trash"] or shutil.which("trash-put") and ["trash-put"]
-            for p in paths:
+            for p in files + dirs:
                 if exe:
                     subprocess.run(exe + [p], capture_output=True, timeout=120)
     except Exception:
         pass
 
 
+def _covered(path, roots):
+    return any(path == d or path.startswith(d + os.sep) for d in roots)
+
+
+def _trim_map(nodes, gone):
+    out = []
+    for n in nodes or []:
+        if _covered(n.get("path", ""), gone):
+            continue
+        n = dict(n)
+        n["children"] = _trim_map(n.get("children"), gone)
+        out.append(n)
+    return out
+
+
 def prune(done):
-    r, ds = S["res"], set(done)
-    r["files"] = [f for f in r["files"] if f["path"] not in ds]
-    r["archives"] = [a for a in r["archives"] if a["path"] not in ds]
+    r, gone = S["res"], set(done)
+    if not r:
+        return
+
+    def keep(path):
+        return not _covered(path, gone)
+
+    r["files"] = [f for f in r["files"] if keep(f["path"])]
+    r["folders"] = [f for f in r.get("folders", []) if keep(f["path"])]
+    r["archives"] = [a for a in r["archives"] if keep(a["path"])]
+    r["junk_files"] = [j for j in r.get("junk_files") or [] if keep(j["path"])]
+    r["scarto_extra"] = [j for j in r.get("scarto_extra") or [] if keep(j["path"])]
+    r["map"] = _trim_map(r.get("map"), gone)
+    r["games"] = [f for f in r["folders"] if f["cat"] == GAME]
     gs = []
     for g in r["dups"]:
-        k = [i for i, p in enumerate(g["paths"]) if p not in ds]
+        k = [i for i, p in enumerate(g["paths"]) if keep(p)]
         if len(k) > 1:
             g["paths"], g["mt"] = [g["paths"][i] for i in k], [g["mt"][i] for i in k]
             g["wasted"] = g["size"] * (len(k) - 1)
             gs.append(g)
     r["dups"], r["wasted"] = gs, sum(g["wasted"] for g in gs)
     r["arch_total"] = sum(a["size"] for a in r["archives"] if a["level"] == "ok")
-    for p in ds:
-        C["ok"].pop(p, None)
+    totals = {}
+    for f in r["folders"]:
+        totals[f["cat"]] = totals.get(f["cat"], 0) + f["size"]
+    r["totals"] = totals
+    covered = [f["path"] for f in r["folders"] if f["cat"] == JUNK]
+    extra = [j for j in r["junk_files"] if not _covered(j["path"], covered)]
+    r["scarto_extra"] = extra
+    r["scarto_total"] = sum(f["size"] for f in r["folders"] if f["cat"] == JUNK) + sum(j["size"] for j in extra)
+    for p in list(C.get("ok", {})):
+        if not keep(p):
+            C["ok"].pop(p, None)
+    for p in list(C.get("dirs", ())):
+        if not keep(p):
+            C["dirs"].discard(p)
+            C.get("dirsize", {}).pop(p, None)
+
+
+def _safe_dir(p):
+    """Cartella della mappa che si può spostare. Mai un disco intero o una cartella di sistema."""
+    if p not in C.get("dirs", ()) or p in C.get("map_roots", ()):
+        return False
+    if not os.path.isabs(p) or os.path.dirname(p) == p:
+        return False
+    low = p.lower()
+    if low in SYSDIRS or any(low == s or low.startswith(s + os.sep) for s in SYS if s):
+        return False
+    return True
 
 
 def do_trash(paths):
-    ok, bad, req = [], [], []
-    for p in paths:
-        sz = C["ok"].get(p)
+    bad, files, folders = [], [], []
+    seen = set()
+    for raw in paths:
+        if not isinstance(raw, str) or "\0" in raw:
+            bad.append([str(raw), "percorso non valido"])
+            continue
+        p = os.path.normpath(raw)
+        if p in seen:
+            continue
+        seen.add(p)
         try:
-            if sz is None:
-                bad.append([p, "non autorizzato"])
-            elif os.path.islink(p):
+            if os.path.islink(p):
                 bad.append([p, "collegamento simbolico: non toccato"])
-            elif not os.path.isfile(p) or os.path.getsize(p) != sz:
-                bad.append([p, "il file è cambiato o non esiste più"])
+            elif p in C.get("dirs", ()) and os.path.isdir(p):
+                if not _safe_dir(p):
+                    bad.append([p, "cartella di sistema, disco intero o non autorizzata"])
+                else:
+                    folders.append(p)
+            elif p in C.get("ok", {}):
+                sz = C["ok"][p]
+                if not os.path.isfile(p) or os.path.getsize(p) != sz:
+                    bad.append([p, "il file è cambiato o non esiste più"])
+                else:
+                    files.append(p)
             else:
-                req.append(p)
+                bad.append([p, "non autorizzato"])
         except OSError as e:
             bad.append([p, str(e)])
-    rs = set(req)
-    for g in S["res"]["dups"]:  # sicurezza: di un gruppo di doppioni resta sempre almeno una copia
+    # una cartella già scelta copre i file che contiene
+    files = [p for p in files if not _covered(p, folders)]
+    rs = set(files)
+    for g in (S.get("res") or {}).get("dups") or []:  # di un gruppo di doppioni resta sempre almeno una copia
         if set(g["paths"]) <= rs:
             for p in g["paths"]:
                 rs.discard(p)
                 bad.append([p, "tenuta almeno una copia di sicurezza"])
-    trash_many(sorted(rs))
-    done = [p for p in sorted(rs) if not os.path.exists(p)]
-    bad += [[p, "Cestino non disponibile o operazione non riuscita"] for p in sorted(rs) if os.path.exists(p)]
-    freed = sum(C["ok"].get(p, 0) for p in done)
+    ordered = sorted(folders) + sorted(rs)
+    trash_many(ordered)
+    done = [p for p in ordered if not os.path.exists(p)]
+    bad += [[p, "Cestino non disponibile o operazione non riuscita"] for p in ordered if os.path.exists(p)]
+    freed = 0
+    for p in done:
+        freed += C.get("dirsize", {}).get(p, 0) if p in folders else C.get("ok", {}).get(p, 0)
     prune(done)
     return {"done": done, "failed": bad, "freed": freed}
 
@@ -574,8 +738,8 @@ def do_trash(paths):
 # ====================================================================================
 #  Account, sicurezza e server web (solo 127.0.0.1)
 # ====================================================================================
-APP = "Twenties Cleaning"
-VERSION = "1.0.3"
+APP = "Twenties"
+VERSION = "1.1.0"
 HOST = "127.0.0.1"
 PLATFORM = "win" if IS_WIN else "mac" if IS_MAC else "linux"
 PORT, SCHEME, BASE, TLS_ON = 8765, "http", "", False
@@ -590,7 +754,7 @@ OAUTH, OAL = {}, threading.Lock()
 HANDOFF, HL = {}, threading.Lock()  # ticket monouso: il browser di sistema non condivide i cookie con la finestra
 WINDOW, WINDOW_MODE = None, False
 MODE = "window"                     # window | browser | headless
-DONE_PAGE = '<!doctype html><meta charset="utf-8"><title>Twenties Cleaning</title><body><h2>%s</h2><p>%s</p></body>'
+DONE_PAGE = '<!doctype html><meta charset="utf-8"><title>Twenties</title><body style="font-family:sans-serif"><h2>%s</h2><p>%s</p></body>'
 TOKRE, PRERE = re.compile(r"[A-Za-z0-9_-]{43}"), re.compile(r"[A-Za-z0-9_-]{32}")
 TIKRE = re.compile(r"[A-Za-z0-9_-]{16,80}")
 EMAIL_RE = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -677,7 +841,10 @@ def init_db(path):
     CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         created INTEGER NOT NULL, last INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS resets(id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);""")
+        expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS actions(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, kind TEXT NOT NULL,
+        summary TEXT NOT NULL, undo TEXT);""")
     if not IS_WIN:
         os.chmod(path, 0o600)
     now = int(time.time())
@@ -689,6 +856,252 @@ def dbx(sql, a=()):
     with DBL:
         cur = CON.execute(sql, a)
         return cur.fetchall(), cur.rowcount, cur.lastrowid
+
+
+SYSTEM_LANG = "en"
+UPDATE_API = "https://api.github.com/repos/twoventi/twenties-cleaning/releases/latest"
+
+
+def setting(k, default=None):
+    if CON is None:
+        return default
+    rows = dbx("SELECT v FROM settings WHERE k=?", (k,))[0]
+    return rows[0]["v"] if rows else default
+
+
+def set_setting(k, v):
+    dbx("INSERT OR REPLACE INTO settings(k,v) VALUES(?,?)", (k, str(v)))
+
+
+def detect_lang():
+    """Italiano se il sistema è in italiano, altrimenti inglese."""
+    parts = []
+    for key in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):
+        raw = os.environ.get(key, "")
+        for piece in raw.split(":"):
+            p = piece.split(".")[0].strip().lower().replace("-", "_")
+            if p and p not in ("c", "posix"):
+                parts.append(p)
+    for p in parts:
+        if p == "it" or p.startswith("it_"):
+            return "it"
+    if not parts and IS_WIN:
+        try:
+            import ctypes
+            if (ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF) == 0x10:
+                return "it"
+        except Exception:
+            pass
+    if not parts and IS_MAC:
+        try:
+            r = subprocess.run(["defaults", "read", "-g", "AppleLanguages"], capture_output=True, text=True, timeout=2)
+            head = (r.stdout or "").lower()[:120]
+            if "it-" in head or "it_" in head or '"it"' in head:
+                return "it"
+        except Exception:
+            pass
+    return "en"
+
+
+def active_lang():
+    v = setting("lang", "")
+    return v if v in ("it", "en") else SYSTEM_LANG
+
+
+def parse_ver(s):
+    s = str(s or "").strip().lstrip("vV")
+    if not s:
+        return None
+    parts = []
+    for p in s.split("."):
+        n = ""
+        for ch in p:
+            if ch.isdigit():
+                n += ch
+            else:
+                break
+        if n == "":
+            return None
+        parts.append(int(n))
+    return tuple(parts)
+
+
+def newer(remote, local):
+    a, b = parse_ver(remote), parse_ver(local)
+    if not a or not b:
+        return False
+    n = max(len(a), len(b))
+    a += (0,) * (n - len(a))
+    b += (0,) * (n - len(b))
+    return a > b
+
+
+def latest_release():
+    """Solo con consenso. Con TC_UPDATE_FIXTURE non esce dalla macchina (i test)."""
+    fixture = os.environ.get("TC_UPDATE_FIXTURE", "").strip()
+    if fixture:
+        with open(fixture, encoding="utf-8") as f:
+            return json.load(f)
+    req = urllib.request.Request(UPDATE_API, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Twenties/" + VERSION,
+    })
+    with urllib.request.urlopen(req, timeout=8) as r:
+        return json.loads(r.read(1 << 20))
+
+
+def schedule_state():
+    enabled = setting("schedule", "0") == "1"
+    try:
+        days = min(90, max(1, int(setting("schedule_days", "7") or 7)))
+    except ValueError:
+        days = 7
+    try:
+        last = int(setting("schedule_last", "0") or 0)
+    except ValueError:
+        last = 0
+    due = bool(enabled and (time.time() - last) >= days * 86400)
+    return {"enabled": enabled, "days": days, "due": due, "last": last}
+
+
+def scarto_preview():
+    """Cartelle etichettate Scarto e i file di scarto che non ci stanno già dentro."""
+    res = S.get("res") or {}
+    items = []
+    for f in res.get("folders") or []:
+        if f.get("cat") == JUNK:
+            items.append({"path": f["path"], "name": f["name"], "size": f["size"], "why": f.get("why") or "", "kind": "folder"})
+    for j in res.get("scarto_extra") or []:
+        items.append({"path": j["path"], "name": j.get("name") or os.path.basename(j["path"]), "size": j["size"],
+                      "why": "temporaneo, cache, log o backup", "kind": "file"})
+    return items
+
+
+def log_action(kind, summary, undo=None):
+    dbx("INSERT INTO actions(ts,kind,summary,undo) VALUES(?,?,?,?)",
+        (int(time.time()), kind, summary[:500], json.dumps(undo, ensure_ascii=False) if undo else None))
+    dbx("DELETE FROM actions WHERE id NOT IN (SELECT id FROM actions ORDER BY id DESC LIMIT 200)")
+    rows = dbx("SELECT id FROM actions ORDER BY id DESC LIMIT 1")[0]
+    return rows[0]["id"] if rows else None
+
+
+def _trash_home():
+    if IS_WIN:
+        return None
+    if IS_MAC:
+        return os.path.expanduser("~/.Trash")
+    data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(data, "Trash")
+
+
+def restore_one(path):
+    """Rimette un percorso al suo posto, se il Cestino lo permette ancora. Altrimenti False."""
+    if os.path.lexists(path):
+        return False
+    home = _trash_home()
+    if not home:
+        return _restore_windows(path)
+    if IS_MAC:
+        src = os.path.join(home, os.path.basename(path))
+        if os.path.exists(src):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            shutil.move(src, path)
+            return True
+        return False
+    info = os.path.join(home, "info")
+    files = os.path.join(home, "files")
+    if not os.path.isdir(info):
+        return False
+    try:
+        names = os.listdir(info)
+    except OSError:
+        return False
+    for name in names:
+        if not name.endswith(".trashinfo"):
+            continue
+        ip = os.path.join(info, name)
+        try:
+            text = open(ip, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        origin = ""
+        for line in text.splitlines():
+            if line.startswith("Path="):
+                origin = urllib.parse.unquote(line[5:].strip())
+                break
+        if os.path.normpath(origin) != os.path.normpath(path):
+            continue
+        src = os.path.join(files, name[:-len(".trashinfo")])
+        if not os.path.exists(src):
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        shutil.move(src, path)
+        try:
+            os.remove(ip)
+        except OSError:
+            pass
+        return True
+    return False
+
+
+def _restore_windows(path):
+    name = os.path.basename(path)
+    ps = ("[Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false;"
+          "$name=[Console]::In.ReadToEnd().Trim();"
+          "$shell=New-Object -ComObject Shell.Application;$rb=$shell.NameSpace(10);$ok=$false;"
+          "foreach($item in @($rb.Items())){ if($item.Name -eq $name){ foreach($v in @($item.Verbs())){"
+          " if($v.Name -match 'estore|ipristin|Wiederherstell|Restaurar'){ $v.DoIt(); $ok=$true; break } } } };"
+          "if($ok){'ok'}")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                           input=b"\xef\xbb\xbf" + name.encode("utf-8"), capture_output=True, timeout=60, **NW)
+        return b"ok" in (r.stdout or b"") and os.path.exists(path)
+    except Exception:
+        return False
+
+
+def restore_paths(paths):
+    restored, failed = [], []
+    for p in paths:
+        try:
+            if restore_one(p):
+                restored.append(p)
+            else:
+                failed.append(p)
+        except Exception:
+            failed.append(p)
+    return restored, failed
+
+
+def asset_text(name):
+    roots = []
+    if getattr(sys, "frozen", False):
+        me = getattr(sys, "_MEIPASS", "")
+        if me:
+            roots.append(me)
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots += [os.path.dirname(here), here]
+    for root in roots:
+        p = os.path.join(root, "assets", name)
+        if os.path.isfile(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    return f.read()
+            except OSError:
+                continue
+    return ""
+
+
+def adopt_scan(uid):
+    """Chi entra tiene l'analisi fatta senza account. Non tocca l'analisi di un altro account."""
+    if S.get("owner") in (None, 0) and S.get("res"):
+        S["owner"] = uid
+
+
+def release_scan(uid):
+    """Uscendo, l'analisi resta su questo computer e si continua a vederla senza account."""
+    if S.get("owner") == uid:
+        S["owner"] = 0
 
 
 # ---------------------------------------------------------------- password (scrypt + sale casuale)
@@ -952,6 +1365,18 @@ class H(BaseHTTPRequestHandler):
 
     do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = other  # nessun CORS: le altre origini non possono leggere né scrivere
 
+    def actor(self):
+        s = self.session()
+        return s["uid"] if s else 0
+
+    def owns(self):
+        """L'analisi senza account (owner 0) resta visibile su questo computer. Quella di un altro account no."""
+        owner = S.get("owner")
+        if owner in (None, 0):
+            return True
+        s = self.session()
+        return bool(s) and owner == s["uid"]
+
     # ---------- GET
     def do_GET(self):
         try:
@@ -962,35 +1387,67 @@ class H(BaseHTTPRequestHandler):
             if self.headers.get("Host", "").split(":")[0] != "127.0.0.1" and p in ("/", "/reset", "/auth/google", "/auth/google/callback", "/auth/finish"):
                 return self.redirect(BASE + p + ("?" + u.query if u.query else ""))
             ip, s = self.client_address[0], self.session()
+            if p in ("/logo.svg", "/favicon.svg"):
+                body = asset_text("logo.svg") or FALLBACK_LOGO
+                return self.send(200, body, "image/svg+xml")
+            if p == "/logo-mono.svg":
+                return self.send(200, asset_text("logo-mono.svg") or FALLBACK_LOGO, "image/svg+xml")
             if p in ("/", "/reset"):
                 _, ck = self.pre_cookie()
                 nonce = secrets.token_urlsafe(16)
-                return self.send(200, PAGE.replace("__NONCE__", nonce), "text/html", cookies=ck, nonce=nonce)
+                html = PAGE.replace("__NONCE__", nonce).replace("__I18N__", json.dumps(I18N, ensure_ascii=False))
+                return self.send(200, html, "text/html", cookies=ck, nonce=nonce)
             if p == "/api/me":
                 pre, ck = self.pre_cookie()
                 b = ("s:" + s["sid"]) if s else "p:" + pre
                 return self.jout({"user": {"email": s["email"], "name": s["name"]} if s else None, "csrf": csrf_for(b),
                                   "google": bool(G_ID and G_SECRET), "mail": bool(os.environ.get("SMTP_HOST")),
-                                  "platform": PLATFORM, "app": APP, "version": VERSION, "window": WINDOW_MODE}, cookies=ck)
+                                  "platform": PLATFORM, "app": APP, "version": VERSION, "window": WINDOW_MODE,
+                                  "lang": active_lang(), "updates": setting("updates", "0") == "1",
+                                  "onboarded": setting("onboarded", "0") == "1", "schedule": schedule_state()}, cookies=ck)
             if p == "/api/focus":  # una seconda copia della STESSA versione chiede di riportare in primo piano la finestra
                 self.raise_window()
                 return self.jout({"app": APP, "version": VERSION, "window": WINDOW_MODE})
+            if p == "/api/i18n":
+                lang = active_lang()
+                return self.jout({"lang": lang, "available": ["it", "en"], "tagline": I18N[lang]["tagline"], "catalog": I18N})
+            if p == "/api/settings":
+                return self.jout({"lang": active_lang(), "updates": setting("updates", "0") == "1",
+                                  "onboarded": setting("onboarded", "0") == "1", "schedule": schedule_state()})
             if p == "/auth/google":
                 return self.google_start(ip, (qs.get("t") or [""])[0])
             if p == "/auth/google/callback":
                 return self.google_cb(qs)
             if p == "/auth/finish":
                 return self.auth_finish((qs.get("t") or [""])[0])
-            if p in ("/api/drives", "/api/status", "/api/results"):
-                if not s:
-                    return self.err(401, "Accesso richiesto")
-                mine = S["owner"] == s["uid"]
-                if p == "/api/drives":
-                    return self.jout(drives())
+            if p == "/api/drives":
+                return self.jout(drives())
+            if p in ("/api/status", "/api/results", "/api/map", "/api/schedule", "/api/history"):
+                mine = self.owns()
                 if p == "/api/status":
                     r = {k: v for k, v in S.items() if k not in ("res", "owner")} if mine else {"phase": "idle"}
                     r["has_res"] = bool(mine and S["res"])
                     return self.jout(r)
+                if p == "/api/map":
+                    res = S.get("res") or {}
+                    return self.jout({"roots": (res.get("map") or []) if mine else [], "scarto": res.get("scarto_total", 0) if mine else 0})
+                if p == "/api/schedule":
+                    stt = schedule_state()
+                    stt["preview"] = scarto_preview() if mine and stt["due"] else []
+                    stt["estimate"] = (S.get("res") or {}).get("scarto_total", 0) if mine else 0
+                    return self.jout(stt)
+                if p == "/api/history":
+                    rows = dbx("SELECT id, ts, kind, summary, undo FROM actions ORDER BY id DESC LIMIT 40")[0]
+                    out = []
+                    for row in rows:
+                        can = False
+                        if row["undo"]:
+                            try:
+                                can = not json.loads(row["undo"]).get("used")
+                            except Exception:
+                                can = False
+                        out.append({"id": row["id"], "ts": row["ts"], "kind": row["kind"], "summary": row["summary"], "can_undo": can})
+                    return self.jout(out)
                 return self.jout(S["res"] if mine and S["res"] else {})
             self.err(404, "Non trovato")
         except Exception:
@@ -1046,7 +1503,7 @@ class H(BaseHTTPRequestHandler):
                 with HL:
                     if tk in HANDOFF:
                         HANDOFF[tk] = ["fail", time.time() + 300]
-                return self.send(200, DONE_PAGE % ("Accesso non riuscito", "Torna a Twenties Cleaning e riprova."), "text/html")
+                return self.send(200, DONE_PAGE % ("Accesso non riuscito", "Torna a Twenties e riprova."), "text/html")
             return self.redirect("/?e=google_fail")
         if not ent or ent[3] < time.time() or not self.pre() or not eq(ent[2], self.pre()) or qs.get("error") or not code or len(code) > 2048:
             return fail()
@@ -1065,7 +1522,7 @@ class H(BaseHTTPRequestHandler):
             with HL:
                 if tk in HANDOFF:
                     HANDOFF[tk] = [tok, time.time() + 120]
-                    return self.send(200, DONE_PAGE % ("Accesso completato", "Puoi chiudere questa scheda e tornare a Twenties Cleaning."), "text/html")
+                    return self.send(200, DONE_PAGE % ("Accesso completato", "Puoi chiudere questa scheda e tornare a Twenties."), "text/html")
         self.redirect("/", [self.mk(SN, tok)])
 
     def auth_finish(self, ticket):
@@ -1142,13 +1599,22 @@ class H(BaseHTTPRequestHandler):
                     return self.err(429, "Troppe richieste. Riprova tra poco.", headers=[("Retry-After", "60")])
                 RL.add("pub:" + ip)
                 return pub[p](d, ip)
+            guest = {"/api/start": self.p_start, "/api/stop": self.p_stop, "/api/reveal": self.p_reveal,
+                     "/api/trash": self.p_trash, "/api/quit": self.p_quit, "/api/settings": self.p_settings,
+                     "/api/lang": self.p_lang, "/api/update_check": self.p_update, "/api/schedule": self.p_schedule,
+                     "/api/schedule_apply": self.p_schedule_apply, "/api/undo": self.p_undo}
+            if p in guest:
+                key = "api:" + (s["sid"] if s else ip)
+                if RL.count(key, 60) >= 240:
+                    return self.err(429, "Troppe richieste. Riprova tra poco.", headers=[("Retry-After", "30")])
+                RL.add(key)
+                return guest[p](d, s)
             if not s:
                 return self.err(401, "Accesso richiesto")
             if RL.count("api:" + s["sid"], 60) >= 240:
                 return self.err(429, "Troppe richieste. Riprova tra poco.", headers=[("Retry-After", "30")])
             RL.add("api:" + s["sid"])
-            fn = {"/api/logout": self.p_logout, "/api/start": self.p_start, "/api/stop": self.p_stop, "/api/reveal": self.p_reveal,
-                  "/api/trash": self.p_trash, "/api/quit": self.p_quit, "/api/delete_account": self.p_delete}.get(p)
+            fn = {"/api/logout": self.p_logout, "/api/delete_account": self.p_delete}.get(p)
             if not fn:
                 return self.err(404, "Non trovato")
             fn(d, s)
@@ -1164,6 +1630,7 @@ class H(BaseHTTPRequestHandler):
         if old:
             dbx("DELETE FROM sessions WHERE id=?", (old["sid"],))
         tok, sid = new_session(uid)
+        adopt_scan(uid)
         self.jout({"user": user, "csrf": csrf_for("s:" + sid)}, cookies=[self.mk(SN, tok)])
 
     def p_register(self, d, ip):
@@ -1240,6 +1707,7 @@ class H(BaseHTTPRequestHandler):
         self.jout({"ok": True})
 
     def p_logout(self, d, s):
+        release_scan(s["uid"])
         dbx("DELETE FROM sessions WHERE id=?", (s["sid"],))
         pre, ck = self.pre_cookie()
         self.jout({"ok": True, "csrf": csrf_for("p:" + pre)}, cookies=ck + [self.mk(SN, "", 0)])
@@ -1255,31 +1723,122 @@ class H(BaseHTTPRequestHandler):
             return self.err(400, "Dimensione minima non valida.")
         if not roots:
             return self.err(400, "Nessuna cartella valida selezionata.")
+        me = self.actor()
         with START_LOCK:
             if S["phase"] in RUNNING:
-                return self.err(409, "Analisi già in corso." if S["owner"] == s["uid"] else "Un'altra sessione sta analizzando il computer. Riprova tra poco.")
-            S.update(owner=s["uid"], phase="scan", count=0, current="", done=0, total=0, stop=False, error="", res=None, denied=0)
+                return self.err(409, "Analisi già in corso." if S["owner"] == me else "Un'altra sessione sta analizzando il computer. Riprova tra poco.")
+            S.update(owner=me, phase="scan", count=0, current="", done=0, total=0, stop=False, error="", res=None, denied=0)
         threading.Thread(target=run, args=(roots, bool(d.get("dups")), bool(d.get("arch")), mb), daemon=True).start()
         self.jout({})
 
     def p_stop(self, d, s):
-        if S["owner"] == s["uid"]:
+        if S["owner"] == self.actor():
             S["stop"] = True
         self.jout({})
 
     def p_reveal(self, d, s):
         p = d.get("path")
-        if S["owner"] == s["uid"] and isinstance(p, str) and p in allowed_paths():
+        if self.owns() and isinstance(p, str) and (p in allowed_paths() or p in C.get("dirs", ())):
             reveal(p)
         self.jout({})
 
     def p_trash(self, d, s):
         paths = d.get("paths")
-        if S["owner"] != s["uid"] or not S["res"] or S["phase"] != "done":
+        if not self.owns() or not S["res"] or S["phase"] != "done":
             return self.err(403, "Nessun risultato disponibile.")
         if not isinstance(paths, list) or len(paths) > 2000 or not all(isinstance(x, str) and len(x) < 4096 for x in paths):
             return self.err(400, "Selezione non valida.")
-        self.jout(do_trash(paths))
+        out = do_trash(paths)
+        if out.get("done"):
+            out["undo"] = log_action("trash", "Spostati nel Cestino: %d" % len(out["done"]), {"paths": out["done"]})
+        self.jout(out)
+
+    def p_settings(self, d, s):
+        if "lang" in d:
+            if d.get("lang") not in ("it", "en"):
+                return self.err(400, "Lingua non valida.")
+            set_setting("lang", d["lang"])
+        if "updates" in d:
+            set_setting("updates", "1" if d.get("updates") else "0")
+        if "onboarded" in d:
+            set_setting("onboarded", "1" if d.get("onboarded") else "0")
+        if "schedule" in d:
+            set_setting("schedule", "1" if d.get("schedule") else "0")
+            if not d.get("schedule"):
+                set_setting("schedule_last", "0")
+        if d.get("schedule_dismiss"):
+            set_setting("schedule_last", str(int(time.time())))
+        if "schedule_days" in d:
+            try:
+                days = min(90, max(1, int(d.get("schedule_days"))))
+            except (TypeError, ValueError):
+                return self.err(400, "Intervallo non valido.")
+            set_setting("schedule_days", str(days))
+        self.jout({"lang": active_lang(), "updates": setting("updates", "0") == "1",
+                   "onboarded": setting("onboarded", "0") == "1", "schedule": schedule_state()})
+
+    def p_lang(self, d, s):
+        if d.get("lang") not in ("it", "en"):
+            return self.err(400, "Lingua non valida.")
+        set_setting("lang", d["lang"])
+        self.jout({"lang": d["lang"], "tagline": I18N[d["lang"]]["tagline"]})
+
+    def p_update(self, d, s):
+        """Con consenso legge solo l'ultima release pubblica. Senza consenso non esce nulla dal computer."""
+        if setting("updates", "0") != "1":
+            return self.jout({"consent": False, "current": VERSION})
+        try:
+            data = latest_release()
+        except Exception:
+            return self.jout({"consent": True, "current": VERSION, "error": "unavailable"})
+        if not isinstance(data, dict):
+            return self.jout({"consent": True, "current": VERSION, "error": "unavailable"})
+        tag = str(data.get("tag_name") or "")
+        url = str(data.get("html_url") or "https://github.com/twoventi/twenties-cleaning/releases/latest")
+        if not url.startswith("https://github.com/twoventi/twenties-cleaning/"):
+            url = "https://github.com/twoventi/twenties-cleaning/releases/latest"
+        latest = tag[1:] if tag[:1] in ("v", "V") else tag
+        self.jout({"consent": True, "current": VERSION, "latest": latest, "update": newer(tag, VERSION), "url": url})
+
+    def p_schedule(self, d, s):
+        return self.p_settings(d, s)
+
+    def p_schedule_apply(self, d, s):
+        if setting("schedule", "0") != "1":
+            return self.err(403, "La pulizia programmata è spenta.")
+        if not self.owns() or not S.get("res") or S.get("phase") != "done":
+            return self.err(403, "Serve prima un'analisi, per vedere l'anteprima.")
+        paths = d.get("paths")
+        allowed = {i["path"] for i in scarto_preview()}
+        if not isinstance(paths, list) or not paths or len(paths) > 2000 or not all(isinstance(x, str) and x in allowed for x in paths):
+            return self.err(400, "L'anteprima non corrisponde. Ricaricala.")
+        out = do_trash(paths)
+        set_setting("schedule_last", str(int(time.time())))
+        if out.get("done"):
+            out["undo"] = log_action("schedule", "Scarto spostato nel Cestino: %d" % len(out["done"]), {"paths": out["done"]})
+        self.jout(out)
+
+    def p_undo(self, d, s):
+        try:
+            i = int(d.get("id"))
+        except (TypeError, ValueError):
+            return self.err(400, "Azione non valida.")
+        rows = dbx("SELECT id, undo FROM actions WHERE id=?", (i,))[0]
+        if not rows or not rows[0]["undo"]:
+            return self.err(400, "Questa azione non si può annullare.")
+        try:
+            payload = json.loads(rows[0]["undo"])
+        except Exception:
+            return self.err(400, "Questa azione non si può annullare.")
+        if payload.get("used"):
+            return self.err(400, "Già annullata.")
+        restored, failed = restore_paths(payload.get("paths") or [])
+        payload["used"] = True
+        payload["restored"] = restored
+        dbx("UPDATE actions SET undo=? WHERE id=?", (json.dumps(payload, ensure_ascii=False), i))
+        if restored:
+            log_action("restore", "Ripristinati: %d" % len(restored), None)
+        self.jout({"ok": bool(restored), "restored": restored, "failed": failed, "manual": not restored})
 
     def p_delete(self, d, s):
         """Elimina per sempre l'account e i dati collegati (sessioni, link di reset). Con password: serve per confermare."""
@@ -1313,533 +1872,314 @@ class H(BaseHTTPRequestHandler):
         threading.Thread(target=self.server.shutdown, daemon=True).start()
 
 
-PAGE = r"""<!doctype html><html lang="it" data-th="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light dark"><title>Twenties Cleaning</title>
+I18N = {"it":{"app.name":"Twenties","tagline":"Vedi cosa pesa. Decidi tu.","intro.skip":"Salta","intro.next":"Continua","intro.start":"Inizia","intro.1.title":"Vedi cosa pesa.","intro.2.title":"Non tocca da solo.","intro.3.title":"Finisce nel Cestino.","intro.1.body":"Twenties legge cartelle, giochi e file grandi e ti dice perché ogni etichetta è quella. Poi ti fermi tu.","intro.2.body":"Non ottimizza il computer, non svuota nulla in automatico e non tocca sistema, documenti o giochi.","intro.3.body":"Se sposti qualcosa, va nel Cestino. Resta recuperabile finché non lo svuoti tu. Non c'è una cancellazione definitiva.","nav.home":"Panoramica","nav.map":"Mappa","nav.folders":"Cartelle","nav.games":"Libreria giochi","nav.files":"File grandi","nav.dups":"Doppioni","nav.arch":"Archivi già estratti","cat.tutti":"Tutti","cat.gioco":"Gioco","cat.scarto":"Scarto","cat.bassa":"Importanza bassa","cat.media":"Importanza media","cat.elevata":"Importanza elevata","leg.gioco":"File di un gioco. Se non ti serve, toglilo dal suo launcher, non da qui.","leg.scarto":"Cache, file temporanei o log. Di solito si possono spostare, ma controlla il nome.","leg.bassa":"Roba vecchia o che si può scaricare di nuovo: ISO, video fermi da anni, installer.","leg.media":"Contenuti usati di recente, o programmi installati. Meglio non spostarli alla cieca.","leg.elevata":"Documenti, foto, progetti e sistema. L'etichetta dice di tenerli.","why.game":"Cartella di un gioco: c'è un launcher nel percorso, oppure file tipici del motore.","why.junk":"Il nome è cache, temporanei o log. Di solito si possono ricreare.","why.sys":"È una cartella di sistema. Twenties non la propone per lo spostamento.","why.prog.mac":"Programma installato. Si toglie trascinando l'app nel Cestino, non i file interni.","why.prog.win":"Programma installato. Si toglie dalle Impostazioni, non cancellando la cartella.","why.mostlyjunk":"La maggior parte del peso sono file temporanei, log o copie di backup.","why.docs":"Ci sono documenti, foto o progetti. Per questo l'importanza è elevata.","why.down":"È la cartella Download: spesso si può scaricare di nuovo, ma dai un'occhiata.","why.iso":"Immagini disco, ISO o macchine virtuali. Pesano tanto e di solito si possono rifare.","why.oldmedia":"Video, audio o archivi non toccati da più di due anni.","why.media":"Video, audio o archivi. Non è scarto solo perché pesa.","why.oldmix":"Contenuto misto, non toccato da più di due anni.","why.mix":"Contenuto misto, usato di recente.","why.gamefile":"Sta dentro la cartella di un gioco.","why.temp":"Temporaneo, cache, log o copia di backup.","why.inst":"Installer scaricato. Di solito si può scaricare di nuovo.","why.sysfile":"File di sistema. Meglio lasciarlo dov'è.","why.doc":"Documento, foto o progetto personale.","why.isofile":"Immagine disco o ISO. Di solito si può rifare.","why.oldfile":"Media o archivio vecchio, oppure sta in Download.","why.mediafile":"Video, audio o archivio.","why.oldunk":"Tipo non riconosciuto, non modificato da più di due anni.","why.unk":"Tipo non riconosciuto, usato di recente.","hero.title":"Vedi cosa pesa.","hero.body":"Scegli i dischi. L'analisi è in sola lettura: non modifica e non cancella nulla.","go":"Avvia analisi","stop":"Ferma","stopping":"Interrompo…","disks":"Dischi","disks.none":"Nessun disco rilevato su questo computer.","disks.pick":"{n} di {all} selezionati","disk.meta":"{used} usati · {free} liberi su {total}","metric.used":"Spazio usato","metric.free":"Spazio libero","metric.cap":"Capacità","metric.one":"1 disco","metric.many":"{n} dischi","status.title":"Stato","status.platform":"Sistema","status.conn":"Connessione","status.local":"Solo questo computer","status.account":"Account","status.google":"Accesso Google","status.analysis":"Analisi","status.running":"In corso","status.ready":"Risultati pronti","status.idle":"In attesa","status.read":"File letti","status.denied":"Cartelle non accessibili","status.rar":"Lettura RAR e 7z","status.yes":"Disponibile","status.no":"Non disponibile","quick.title":"Come analizzare","quick.hint":"I doppioni partono dalla dimensione che indichi. Il confronto è sull'hash del contenuto, non sul nome.","opt.dups":"Doppioni esatti","opt.dups_from":"solo file da","opt.dups_why":"Due file entrano nel gruppo solo se l'hash BLAKE2b dell'intero contenuto coincide. Di ogni gruppo resta sempre una copia.","opt.arch":"Archivi già estratti","opt.arch_hint":"ZIP e TAR sempre. RAR e 7z se sul computer c'è 7-Zip o UnRAR.","opt.folder":"Cartella specifica da aggiungere, anche sotto OneDrive","about.title":"Cosa guarda","about.body":"Solo quello che il programma sa riconoscere. Se non è sicuro, lo dice.","about.folders.t":"Cartelle","about.folders.d":"Raggruppa le cartelle da almeno 100 MB e mette un'etichetta con il perché.","about.files.t":"File grandi","about.files.d":"Fino a 400 file più pesanti, ognuno con una spiegazione.","about.games.t":"Giochi","about.games.d":"Riconosce Steam, Epic, GOG, Riot, Ubisoft, EA e Xbox dal percorso o dai file.","about.dups.t":"Doppioni","about.dups.d":"Hash identico del contenuto. Non basta che il nome sia uguale.","about.arch.t":"Archivi","about.arch.d":"Segna un archivio solo se i file estratti sono già sul disco.","prog.title":"Analisi in corso","prog.body":"Puoi lasciare questa finestra aperta. Non viene spostato nulla.","step.scan":"1 · Lettura","step.agg":"2 · Cartelle","step.dups":"3 · Doppioni","step.arch":"4 · Archivi","scan.files":"{n} file letti · {p}","scan.agg":"Sto sommando le cartelle.","scan.checked":"{d} / {t} elementi controllati","again":"Nuova analisi","settings":"Impostazioni","theme":"Tema","account":"Account","logout":"Esci","logout.done":"Sei uscito. L'analisi resta su questo computer.","quit":"Chiudi","close.ask.title":"Chiudere Twenties?","close.ask.body":"Il programma si chiude. I file del computer restano dove sono.","close.ask.ok":"Chiudi","closed.title":"Programma chiuso","closed.body":"Puoi chiudere questa scheda.","who.guest":"Senza account","greet.night":"Buonanotte","greet.morning":"Buongiorno","greet.afternoon":"Buon pomeriggio","greet.evening":"Buonasera","auth.login.title":"Account, se ti serve.","auth.login.sub":"Non è obbligatorio. Serve solo se vuoi una password su questo computer.","auth.register.title":"Crea un account locale.","auth.register.sub":"Email e password restano su questo computer.","auth.forgot.title":"Password dimenticata","auth.forgot.sub":"Se non c'è un server di posta, la password non si recupera da qui.","auth.reset.title":"Nuova password","auth.reset.sub":"Almeno 10 caratteri. Poi puoi entrare, oppure continuare senza account.","auth.email":"Email","auth.password":"Password","auth.submit.login":"Entra","auth.submit.register":"Crea account","auth.submit.forgot":"Chiedi il link","auth.submit.reset":"Aggiorna password","auth.or":"oppure","auth.google":"Continua con Google","auth.google.off":"L'accesso con Google non è configurato su questo computer.","auth.forgot.link":"Password dimenticata","auth.back":"Torna all'accesso","auth.guest":"Continua senza account","auth.forgot.sent":"Se l'account c'è, il link è in viaggio. Scade tra 15 minuti.","auth.forgot.nomail":"Da qui non partono email, quindi la password non si recupera. I file non vengono toccati: puoi continuare senza account.","auth.reset.ok":"Password aggiornata. Puoi entrare quando vuoi.","session.expired":"La sessione è scaduta. Entra di nuovo, oppure continua senza account.","google.wait":"Completa l'accesso nel browser, poi torna qui.","google.fail":"Accesso con Google non riuscito.","google.timeout":"Tempo scaduto. Riprova.","feat.see.t":"Mostra, non sistema.","feat.see.d":"L'analisi legge il disco e si ferma. Nessun file cambia posto da solo.","feat.hash.t":"Doppioni con lo stesso hash","feat.hash.d":"Conta solo se il contenuto è identico. Una copia del gruppo resta sempre.","feat.bin.t":"Solo nel Cestino","feat.bin.d":"Si sposta solo ciò che confermi. Se il Cestino non c'è, non elimina nulla.","feat.local.t":"Resta qui","feat.local.d":"Niente telemetria. L'unica richiesta esterna, e solo se la accendi, è il controllo versione.","delete.title":"Eliminare l'account?","delete.body":"Spariscono account e sessioni salvati su questo computer. I file del disco non si toccano. L'app si continua a usare senza account.","delete.pw":"Password, se l'account ne ha una","delete.ok":"Elimina l'account","delete.done":"Account eliminato. I file sono ancora al loro posto.","trash.ask.title":"Spostare nel Cestino?","trash.ask.body":"{n} elementi andranno nel Cestino. Potrai ripristinarli da lì. Di ogni gruppo di doppioni resta una copia.","trash.ask.ok":"Sposta nel Cestino","trash.working":"Sposto nel Cestino…","trash.result":"Spostati {n} · {size}","act.clear":"Deseleziona","act.trash":"Sposta nel Cestino","show.mac":"Mostra nel Finder","show.win":"Mostra","show.linux":"Mostra","perm.mac":"Per le cartelle protette serve l'accesso completo al disco, in Impostazioni di Sistema › Privacy e sicurezza. Poi riapri Twenties.","perm.win":"Avvia Twenties come amministratore per leggere anche le cartelle protette.","perm.linux":"Servono i permessi di lettura su quelle cartelle.","tool.mac":"Per leggere RAR e 7z installa 7-Zip. ZIP e TAR vengono controllati lo stesso.","tool.win":"Per leggere RAR e 7z installa 7-Zip o WinRAR. ZIP e TAR vengono controllati lo stesso.","tool.linux":"Per leggere RAR e 7z installa 7-Zip. ZIP e TAR vengono controllati lo stesso.","home.scarto.kicker":"Stima dello Scarto","home.scarto.note":"È la somma delle cartelle etichettate Scarto, più i file di scarto che non stanno già in quelle cartelle. Non include doppioni né archivi, e non è spazio che sparirà da solo: qualche file potrebbe ancora servirti.","home.denied":"{n} cartelle non erano leggibili e sono state saltate.","home.stats.folders":"Cartelle","home.stats.files":"File grandi","home.stats.games":"Giochi","home.stats.dups":"Gruppi di doppioni","home.stats.arch":"Archivi già estratti","home.stats.copies":"Copie in più","home.stats.scarto":"Scarto","home.stats.free":"Libero sui dischi","home.bycat":"Per etichetta","home.bycat.note":"Peso delle cartelle elencate, non dell'intero disco.","home.quick":"Apri un risultato","home.q.scarto":"Vedi lo Scarto","home.q.dups":"Vedi i doppioni","home.q.arch":"Vedi gli archivi","home.q.games":"Libreria giochi","home.top":"Cartelle più pesanti","home.legend":"Come leggere le etichette","home.disks.note":"{used} usati · {free} liberi · {total} di capacità, sui dischi letti.","intro.folders":"Le cartelle che occupano più spazio, con il perché dell'etichetta.","intro.files":"I singoli file più pesanti. Puoi selezionarli e spostarli nel Cestino.","intro.dups":"Gruppi con lo stesso hash del contenuto. Di ogni gruppo resta sempre una copia.","intro.arch":"Archivi il cui contenuto risulta già estratto sul disco.","search":"Cerca per nome o percorso","sort.size":"Più grandi prima","sort.name":"Nome","sort.date":"Più vecchi prima","selok":"Seleziona i già estratti","keep":"Tieni la copia più vecchia","empty.filters":"Niente da mostrare con questi filtri.","empty.dups":"Nessun doppione, oppure la ricerca era spenta.","dups.hash":"Confronto con hash BLAKE2b sull'intero file.","dups.lead":"Copie in più: {size}.","files.count":"{n} file","modified":"modificato il {d}","level.ok":"Già estratto","level.part":"Estratto in parte","level.guess":"Da verificare","arch.ok":"Tutti i {n} file dell'archivio sono già in: {where}","arch.part":"Estratto solo in parte ({p}%) in: {where}. Controlla prima di spostarlo.","arch.guess":"C'è una cartella con lo stesso nome, ma l'archivio non si legge. Controlla a mano.","map.lead":"Ogni spicchio è una cartella dell'analisi. Il colore è l'etichetta, il testo dice perché.","map.root":"Cartelle analizzate","map.sun":"Anelli","map.tree":"Riquadri","map.back":"Livello sopra","map.open":"Apri cartella","map.trash":"Sposta nel Cestino","map.pick":"Entra in una cartella per aprirla o spostarla. Il disco intero non si sposta.","map.empty":"Qui dentro non ci sono altre cartelle da disegnare.","map.confirm":"Spostare «{name}» nel Cestino? {why} Non è una cancellazione definitiva.","games.lead":"Peso, ultimo accesso e launcher. Il link apre la libreria del launcher, non un gioco preciso: Twenties non conosce l'identificativo del titolo.","games.launcher":"Launcher","games.unknown":"Riconosciuto dai file di gioco, senza un launcher nel percorso.","games.open":"Apri {name}","games.access":"Ultimo accesso","games.modified":"Ultima modifica","games.access.note":"L'ultimo accesso è la data più recente in cui un file della cartella risulta letto. Su alcuni dischi il sistema non la aggiorna: in quel caso coincide con l'ultima modifica, o manca.","games.unknown.date":"non indicato","games.empty":"Nessun gioco in questa analisi.","settings.title":"Impostazioni","settings.lang":"Lingua","settings.lang.why":"All'avvio Twenties usa la lingua del sistema. Qui la cambi per questo computer.","settings.updates":"Avviso di una versione nuova","settings.updates.why":"Se lo accendi, Twenties chiede a GitHub solo il numero dell'ultima versione. Non invia elenchi di file, né un identificativo.","settings.schedule":"Promemoria dello Scarto","settings.schedule.why":"Spento di default. Se lo accendi, ogni tanto prepara un'anteprima del solo Scarto. Non sposta nulla finché non confermi, e il posto è il Cestino.","settings.days":"Ogni quanti giorni","settings.history":"Cronologia","settings.history.empty":"Ancora nessuna azione.","settings.undo":"Annulla","settings.undo.manual":"Non riesco a rimetterlo al posto. È nel Cestino: puoi ripristinarlo da lì.","settings.account":"Account","settings.delete":"Elimina account","common.cancel":"Annulla","common.close":"Chiudi","update.banner":"C'è la versione {v}.","update.open":"Apri la pagina","update.later":"Non ora","schedule.card":"Anteprima dello Scarto","schedule.lead":"Solo cartelle e file etichettati Scarto. Nulla si sposta finché non premi il pulsante, e finisce nel Cestino.","schedule.now":"Sposta questa anteprima nel Cestino","schedule.later":"Non ora","schedule.empty":"Non c'è ancora un'analisi con dello Scarto. Non sposto nulla.","schedule.confirm":"Confermi lo spostamento nel Cestino di tutto quello che è in anteprima? Si può ripristinare dal Cestino.","undo.ok":"Rimessi al loro posto: {n}.","need.root":"Seleziona almeno un disco o scrivi una cartella.","err.offline":"Connessione al programma non riuscita.","err.rate":"Troppi tentativi. Riprova tra qualche minuto."},"en":{"app.name":"Twenties","tagline":"See what takes space. You decide.","intro.skip":"Skip","intro.next":"Continue","intro.start":"Start","intro.1.title":"See what takes space.","intro.2.title":"It does not touch things by itself.","intro.3.title":"It goes to the Trash.","intro.1.body":"Twenties reads folders, games and large files and tells you why each label is there. Then you decide.","intro.2.body":"It does not optimize the computer, it does not clean anything on its own, and it does not touch the system, documents or games.","intro.3.body":"If you move something, it goes to the Trash. You can put it back until you empty the Trash yourself. Nothing is deleted for good.","nav.home":"Overview","nav.map":"Map","nav.folders":"Folders","nav.games":"Game library","nav.files":"Large files","nav.dups":"Duplicates","nav.arch":"Extracted archives","cat.tutti":"All","cat.gioco":"Game","cat.scarto":"Discard","cat.bassa":"Low importance","cat.media":"Medium importance","cat.elevata":"High importance","leg.gioco":"A game's files. If you do not want it, remove it from its launcher, not from here.","leg.scarto":"Cache, temporary files or logs. Usually safe to move, but read the name first.","leg.bassa":"Old or re-downloadable things: disk images, videos untouched for years, installers.","leg.media":"Things used recently, or installed programs. Better not to move them blindly.","leg.elevata":"Documents, photos, projects and the system. The label says to keep them.","why.game":"A game folder: a launcher is in the path, or typical game-engine files are inside.","why.junk":"The name is cache, temporary files or logs. They can usually be recreated.","why.sys":"This is a system folder. Twenties does not offer to move it.","why.prog.mac":"An installed app. Remove it by dragging the app to the Trash, not its inner files.","why.prog.win":"An installed program. Remove it from Settings, not by deleting the folder.","why.mostlyjunk":"Most of the size is temporary files, logs or backup copies.","why.docs":"There are documents, photos or projects. That is why the importance is high.","why.down":"This is Downloads: things can often be downloaded again, but look first.","why.iso":"Disk images, ISOs or virtual machines. They are large and can usually be recreated.","why.oldmedia":"Video, audio or archives not touched for more than two years.","why.media":"Video, audio or archives. Size alone does not make this discard.","why.oldmix":"Mixed content, untouched for more than two years.","why.mix":"Mixed content, used recently.","why.gamefile":"It sits inside a game folder.","why.temp":"Temporary file, cache, log or backup copy.","why.inst":"A downloaded installer. You can usually download it again.","why.sysfile":"A system file. Better to leave it where it is.","why.doc":"A document, photo or personal project.","why.isofile":"A disk image or ISO. It can usually be recreated.","why.oldfile":"Old media or an archive, or it is in Downloads.","why.mediafile":"Video, audio or an archive.","why.oldunk":"Unrecognized type, not modified for more than two years.","why.unk":"Unrecognized type, used recently.","hero.title":"See what takes space.","hero.body":"Pick the drives. The scan is read-only: it does not change or delete anything.","go":"Start scan","stop":"Stop","stopping":"Stopping…","disks":"Drives","disks.none":"No drives found on this computer.","disks.pick":"{n} of {all} selected","disk.meta":"{used} used · {free} free of {total}","metric.used":"Used space","metric.free":"Free space","metric.cap":"Capacity","metric.one":"1 drive","metric.many":"{n} drives","status.title":"Status","status.platform":"System","status.conn":"Connection","status.local":"This computer only","status.account":"Account","status.google":"Google sign-in","status.analysis":"Scan","status.running":"Running","status.ready":"Results ready","status.idle":"Waiting","status.read":"Files read","status.denied":"Folders that could not be read","status.rar":"Reading RAR and 7z","status.yes":"Available","status.no":"Not available","quick.title":"How to scan","quick.hint":"Duplicates start from the size you set. The comparison is a content hash, not the file name.","opt.dups":"Exact duplicates","opt.dups_from":"only files from","opt.dups_why":"Two files join a group only when the BLAKE2b hash of the whole content matches. One copy of each group is always kept.","opt.arch":"Already extracted archives","opt.arch_hint":"ZIP and TAR always. RAR and 7z when 7-Zip or UnRAR is installed.","opt.folder":"A specific folder to add, including under OneDrive","about.title":"What it looks at","about.body":"Only what the program can actually recognize. When it is not sure, it says so.","about.folders.t":"Folders","about.folders.d":"Groups folders from 100 MB up and adds a label with a reason.","about.files.t":"Large files","about.files.d":"Up to 400 of the heaviest files, each with an explanation.","about.games.t":"Games","about.games.d":"Recognizes Steam, Epic, GOG, Riot, Ubisoft, EA and Xbox from the path or the files.","about.dups.t":"Duplicates","about.dups.d":"Identical content hash. A matching name is not enough.","about.arch.t":"Archives","about.arch.d":"Marks an archive only when the extracted files are already on disk.","prog.title":"Scan in progress","prog.body":"You can leave this window open. Nothing is moved.","step.scan":"1 · Reading","step.agg":"2 · Folders","step.dups":"3 · Duplicates","step.arch":"4 · Archives","scan.files":"{n} files read · {p}","scan.agg":"Adding up the folders.","scan.checked":"{d} / {t} items checked","again":"New scan","settings":"Settings","theme":"Theme","account":"Account","logout":"Sign out","logout.done":"You signed out. The scan stays on this computer.","quit":"Quit","close.ask.title":"Quit Twenties?","close.ask.body":"The program will close. Your files stay where they are.","close.ask.ok":"Quit","closed.title":"Program closed","closed.body":"You can close this tab.","who.guest":"No account","greet.night":"Good night","greet.morning":"Good morning","greet.afternoon":"Good afternoon","greet.evening":"Good evening","auth.login.title":"An account, if you want one.","auth.login.sub":"It is optional. It only adds a password on this computer.","auth.register.title":"Create a local account.","auth.register.sub":"Email and password stay on this computer.","auth.forgot.title":"Forgot your password","auth.forgot.sub":"Without a mail server, the password cannot be recovered from here.","auth.reset.title":"New password","auth.reset.sub":"At least 10 characters. Then you can sign in, or keep going without an account.","auth.email":"Email","auth.password":"Password","auth.submit.login":"Sign in","auth.submit.register":"Create account","auth.submit.forgot":"Request the link","auth.submit.reset":"Update password","auth.or":"or","auth.google":"Continue with Google","auth.google.off":"Google sign-in is not set up on this computer.","auth.forgot.link":"Forgot password","auth.back":"Back to sign-in","auth.guest":"Continue without an account","auth.forgot.sent":"If the account exists, the link is on its way. It expires in 15 minutes.","auth.forgot.nomail":"This app does not send email, so the password cannot be recovered. Your files are untouched: you can continue without an account.","auth.reset.ok":"Password updated. You can sign in whenever you want.","session.expired":"The session expired. Sign in again, or continue without an account.","google.wait":"Finish signing in in the browser, then come back here.","google.fail":"Google sign-in did not work.","google.timeout":"Timed out. Try again.","feat.see.t":"It shows, it does not tidy up.","feat.see.d":"The scan reads the disk and stops. No file moves on its own.","feat.hash.t":"Duplicates with the same hash","feat.hash.d":"It counts only when the content is identical. One copy of the group always stays.","feat.bin.t":"Only to the Trash","feat.bin.d":"Only what you confirm is moved. If the Trash is not available, nothing is deleted.","feat.local.t":"It stays here","feat.local.d":"No telemetry. The only outside request, and only if you turn it on, is the version check.","delete.title":"Delete the account?","delete.body":"The account and sessions saved on this computer are removed. Files on disk are not touched. You can keep using the app without an account.","delete.pw":"Password, if the account has one","delete.ok":"Delete account","delete.done":"Account deleted. Your files are still in place.","trash.ask.title":"Move to the Trash?","trash.ask.body":"{n} items will go to the Trash. You can restore them from there. One copy of each duplicate group stays.","trash.ask.ok":"Move to the Trash","trash.working":"Moving to the Trash…","trash.result":"Moved {n} · {size}","act.clear":"Clear","act.trash":"Move to the Trash","show.mac":"Show in Finder","show.win":"Show","show.linux":"Show","perm.mac":"Protected folders need Full Disk Access, in System Settings › Privacy & Security. Then reopen Twenties.","perm.win":"Run Twenties as administrator to read protected folders too.","perm.linux":"Read permission is needed for those folders.","tool.mac":"To read RAR and 7z, install 7-Zip. ZIP and TAR are checked anyway.","tool.win":"To read RAR and 7z, install 7-Zip or WinRAR. ZIP and TAR are checked anyway.","tool.linux":"To read RAR and 7z, install 7-Zip. ZIP and TAR are checked anyway.","home.scarto.kicker":"Discard estimate","home.scarto.note":"This is the sum of folders labeled Discard, plus discard files that are not already inside those folders. It does not include duplicates or archives, and it is not space that will vanish on its own: some files may still be useful.","home.denied":"{n} folders could not be read and were skipped.","home.stats.folders":"Folders","home.stats.files":"Large files","home.stats.games":"Games","home.stats.dups":"Duplicate groups","home.stats.arch":"Extracted archives","home.stats.copies":"Extra copies","home.stats.scarto":"Discard","home.stats.free":"Free on the drives","home.bycat":"By label","home.bycat.note":"Weight of the listed folders, not of the whole disk.","home.quick":"Open a result","home.q.scarto":"See Discard","home.q.dups":"See duplicates","home.q.arch":"See archives","home.q.games":"Game library","home.top":"Heaviest folders","home.legend":"How to read the labels","home.disks.note":"{used} used · {free} free · {total} capacity, on the drives that were read.","intro.folders":"The folders that take the most space, with the reason for the label.","intro.files":"The heaviest individual files. You can select them and move them to the Trash.","intro.dups":"Groups with the same content hash. One copy of each group always stays.","intro.arch":"Archives whose content is already extracted on disk.","search":"Search by name or path","sort.size":"Largest first","sort.name":"Name","sort.date":"Oldest first","selok":"Select the extracted ones","keep":"Keep the oldest copy","empty.filters":"Nothing to show with these filters.","empty.dups":"No duplicates, or the search was off.","dups.hash":"Compared with a BLAKE2b hash of the whole file.","dups.lead":"Extra copies: {size}.","files.count":"{n} files","modified":"modified {d}","level.ok":"Already extracted","level.part":"Partly extracted","level.guess":"Check this","arch.ok":"All {n} files from the archive are already in: {where}","arch.part":"Only partly extracted ({p}%) in: {where}. Look before you move it.","arch.guess":"A folder with the same name exists, but the archive could not be read. Check it yourself.","map.lead":"Each slice is a folder from the scan. The color is the label, the text says why.","map.root":"Scanned folders","map.sun":"Rings","map.tree":"Blocks","map.back":"Up one level","map.open":"Open folder","map.trash":"Move to the Trash","map.pick":"Open a folder to reveal it or move it. A whole drive is not moved.","map.empty":"There are no further folders to draw here.","map.confirm":"Move “{name}” to the Trash? {why} This is not a permanent delete.","games.lead":"Size, last access and launcher. The link opens the launcher's library, not one exact game: Twenties does not know the title id.","games.launcher":"Launcher","games.unknown":"Recognized from game files, with no launcher in the path.","games.open":"Open {name}","games.access":"Last access","games.modified":"Last modified","games.access.note":"Last access is the newest time a file in the folder was read. Some disks never update that time: then it matches the last modification, or it is missing.","games.unknown.date":"not recorded","games.empty":"No games in this scan.","settings.title":"Settings","settings.lang":"Language","settings.lang.why":"On startup Twenties uses the system language. Here you change it for this computer.","settings.updates":"Notice of a new version","settings.updates.why":"If you turn this on, Twenties asks GitHub only for the latest version number. It does not send file lists or an identifier.","settings.schedule":"Discard reminder","settings.schedule.why":"Off by default. If you turn it on, it sometimes prepares a preview of Discard only. Nothing moves until you confirm, and the place is the Trash.","settings.days":"Every how many days","settings.history":"History","settings.history.empty":"No actions yet.","settings.undo":"Undo","settings.undo.manual":"I could not put it back. It is in the Trash: you can restore it from there.","settings.account":"Account","settings.delete":"Delete account","common.cancel":"Cancel","common.close":"Close","update.banner":"Version {v} is available.","update.open":"Open the page","update.later":"Not now","schedule.card":"Discard preview","schedule.lead":"Only folders and files labeled Discard. Nothing moves until you press the button, and it goes to the Trash.","schedule.now":"Move this preview to the Trash","schedule.later":"Not now","schedule.empty":"There is no scan with Discard yet. Nothing will be moved.","schedule.confirm":"Move everything in the preview to the Trash? You can restore it from the Trash.","undo.ok":"Put back: {n}.","need.root":"Select at least one drive or type a folder.","err.offline":"Could not reach the program.","err.rate":"Too many attempts. Try again in a few minutes."}}
+
+PAGE = r"""<!doctype html><html lang="it" data-th="light"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light dark"><title>Twenties</title>
+<link rel="icon" href="/logo.svg" type="image/svg+xml">
 <script nonce="__NONCE__">try{document.documentElement.dataset.th=localStorage.getItem("tc_th")||(matchMedia("(prefers-color-scheme:dark)").matches?"dark":"light")}catch(e){}</script>
 <style nonce="__NONCE__">
-:root{--bg:#f5f5f7;--card:#fff;--ink:#000;--inv:#fff;--mu:#6e6e73;--line:rgba(0,0,0,.1);--fill:rgba(0,0,0,.05);--fill2:rgba(0,0,0,.09);--sh:0 1px 2px rgba(0,0,0,.04),0 12px 40px rgba(0,0,0,.06);--f:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Helvetica Neue",Inter,"Segoe UI",system-ui,sans-serif}
-[data-th=dark]{--bg:#000;--card:#1c1c1e;--ink:#f5f5f7;--inv:#000;--mu:#98989d;--line:rgba(255,255,255,.14);--fill:rgba(255,255,255,.08);--fill2:rgba(255,255,255,.14);--sh:none}
+:root{--bg:#F3EEE6;--card:#FFFCF7;--ink:#111114;--inv:#F3EEE6;--mu:#5C574E;--line:rgba(17,17,20,.12);--fill:rgba(17,17,20,.045);--fill2:rgba(17,17,20,.08);--accent:#0F6E6B;--accent-ink:#fff;--sand:#D9CDB8;--warn:#C2410C;--sh:0 1px 2px rgba(17,17,20,.04),0 12px 32px rgba(17,17,20,.06);--f:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Helvetica Neue",Inter,"Segoe UI",system-ui,sans-serif}
+[data-th=dark]{--bg:#111114;--card:#1C1C22;--ink:#F3EEE6;--inv:#111114;--mu:#B7A995;--line:rgba(243,238,230,.14);--fill:rgba(243,238,230,.06);--fill2:rgba(243,238,230,.12);--accent:#1F8F8B;--accent-ink:#fff;--sand:#3A342C;--warn:#E07A45;--sh:none}
 *{box-sizing:border-box}[hidden]{display:none!important}
 html{-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.47 var(--f);letter-spacing:-.011em;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;padding-bottom:100px;transition:background-color .24s ease,color .24s ease}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.47 var(--f);letter-spacing:-.011em;-webkit-font-smoothing:antialiased;padding-bottom:100px;transition:background-color .2s ease,color .2s ease}
 button,input,select{font:inherit;color:inherit;letter-spacing:inherit}
 h1,h2,h3{letter-spacing:-.03em;margin:0}
-a{color:var(--ink)}
-.logo{width:34px;height:34px;border-radius:10px;background:var(--ink);color:var(--inv);display:grid;place-items:center;font-weight:700;font-size:17px;letter-spacing:0}
-/* intro */
-.intro{position:fixed;inset:0;background:#000;color:#fff;z-index:100;display:flex;flex-direction:column;padding:env(safe-area-inset-top) 24px calc(env(safe-area-inset-bottom) + 28px)}
-.intro .skip{align-self:flex-end;margin-top:22px;background:none;border:0;color:#98989d;cursor:pointer;font-size:15px;padding:8px}
+a{color:var(--accent)}
+img.logo{width:34px;height:34px;border-radius:10px;display:block;background:#0B0C12}
+.intro{position:fixed;inset:0;background:#111114;color:#F3EEE6;z-index:100;display:flex;flex-direction:column;padding:env(safe-area-inset-top) 24px calc(env(safe-area-inset-bottom) + 28px)}
+.intro .skip{align-self:flex-end;margin-top:22px;background:none;border:0;color:#B7A995;cursor:pointer;font-size:15px;padding:8px}
 .slides{flex:1;display:grid;place-items:center;position:relative}
-.slide{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;opacity:0;transform:translateY(10px) scale(.985);transition:opacity .28s cubic-bezier(.22,1,.36,1),transform .28s cubic-bezier(.22,1,.36,1);pointer-events:none;padding:0 12px}
+.slide{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;opacity:0;transform:translateY(8px);transition:opacity .22s cubic-bezier(.22,1,.36,1),transform .22s cubic-bezier(.22,1,.36,1);pointer-events:none;padding:0 12px}
 .slide.on{opacity:1;transform:none;pointer-events:auto}
-.slide .mark{width:84px;height:84px;border-radius:24px;background:#fff;color:#000;display:grid;place-items:center;font-size:44px;font-weight:700;margin-bottom:34px;letter-spacing:0}
-.slide svg{width:84px;height:84px;margin-bottom:34px;stroke:#fff;fill:none;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}
-.slide h1,.slide h2{font-size:clamp(40px,9vw,76px);line-height:1.03;font-weight:700;background:linear-gradient(180deg,#fff 30%,#86868b);-webkit-background-clip:text;background-clip:text;color:transparent;padding-bottom:.12em}
-.slide p{color:#a1a1a6;font-size:clamp(17px,2.4vw,22px);max-width:520px;margin:20px 0 0;line-height:1.4}
-.foot{display:flex;flex-direction:column;align-items:center;gap:22px}
-.dots{display:flex;gap:8px}.dots i{width:7px;height:7px;border-radius:9px;background:#3a3a3c;transition:width .22s cubic-bezier(.22,1,.36,1),background .22s ease}.dots i.on{background:#fff;width:22px}
-.intro .pri{background:#fff;color:#000;min-width:220px}
-/* bottoni */
-.btn{background:var(--fill);border:0;border-radius:980px;padding:8px 16px;cursor:pointer;font-size:14px;font-weight:500;transition:background .2s ease,color .2s ease,opacity .2s ease,transform .18s cubic-bezier(.22,1,.36,1)}.btn:hover{background:var(--fill2)}.btn:active{transform:scale(.98)}.btn:disabled{opacity:.4;cursor:default;transform:none}
-.pri{background:var(--ink);color:var(--inv);border:0;border-radius:980px;padding:12px 28px;cursor:pointer;font-weight:600;font-size:16px;transition:transform .18s cubic-bezier(.22,1,.36,1),opacity .2s ease,background .2s ease}.pri:hover{opacity:.86}.pri:active{transform:scale(.98)}.pri:disabled{opacity:.4;cursor:default;transform:none}
+.slide img{width:84px;height:84px;border-radius:24px;margin-bottom:28px}
+.slide h1,.slide h2{font-size:clamp(36px,7vw,64px);line-height:1.05;font-weight:700;color:#F3EEE6}
+.slide p{color:#D9CDB8;font-size:clamp(17px,2.2vw,21px);max-width:540px;margin:18px 0 0;line-height:1.45}
+.foot{display:flex;flex-direction:column;align-items:center;gap:18px}
+.dots{display:flex;gap:8px}.dots i{width:7px;height:7px;border-radius:9px;background:#3a3a3c;transition:width .2s ease,background .2s ease}.dots i.on{background:#F3EEE6;width:22px}
+.btn{background:var(--fill);border:0;border-radius:980px;padding:8px 16px;cursor:pointer;font-size:14px;font-weight:500;transition:background .18s ease,transform .18s cubic-bezier(.22,1,.36,1)}.btn:hover{background:var(--fill2)}.btn:active{transform:scale(.98)}.btn:disabled{opacity:.4;cursor:default;transform:none}
+.pri{background:var(--accent);color:var(--accent-ink);border:0;border-radius:980px;padding:12px 28px;cursor:pointer;font-weight:600;font-size:16px;transition:transform .18s cubic-bezier(.22,1,.36,1),opacity .2s ease}.pri:hover{opacity:.9}.pri:active{transform:scale(.98)}.pri:disabled{opacity:.4;cursor:default;transform:none}
 .wide{width:100%;display:block}
-.chip{border:1px solid var(--line);border-radius:980px;padding:6px 14px;cursor:pointer;color:var(--mu);background:none;font-size:14px;transition:background .2s ease,color .2s ease,border-color .2s ease,transform .18s cubic-bezier(.22,1,.36,1);user-select:none}.chip:hover{background:var(--fill)}.chip:active{transform:scale(.98)}
-.chip.on,.chip:has(input:checked){background:var(--ink);color:var(--inv);border-color:var(--ink)}.chip input{display:none}.chip small{opacity:.7}
-input[type=text],input[type=email],input[type=password],input[type=number],select{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;outline:0;transition:border-color .2s ease,box-shadow .2s ease,background .2s ease}
-[data-th=dark] input[type=text],[data-th=dark] input[type=email],[data-th=dark] input[type=password],[data-th=dark] input[type=number],[data-th=dark] select{background:var(--fill)}
-input:focus,select:focus{border-color:var(--ink);box-shadow:0 0 0 4px var(--fill2)}
-input[type=checkbox]{accent-color:var(--ink);width:17px;height:17px}
-/* accesso */
+.chip{border:1px solid var(--line);border-radius:980px;padding:6px 14px;cursor:pointer;color:var(--mu);background:none;font-size:14px;transition:background .18s ease,color .18s ease,border-color .18s ease}.chip:hover{background:var(--fill)}
+.chip.on,.chip:has(input:checked){background:var(--ink);color:var(--inv);border-color:var(--ink)}.chip input{display:none}
+input[type=text],input[type=email],input[type=password],input[type=number],select{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;outline:0;transition:border-color .18s ease,box-shadow .18s ease}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(15,110,107,.18)}
+input[type=checkbox]{accent-color:var(--accent);width:17px;height:17px}
 #auth{min-height:100vh;display:flex;align-items:flex-start;justify-content:center;padding:32px 20px}
 .auth-wrap{width:min(1120px,100%);margin:auto;display:grid;grid-template-columns:minmax(0,1fr) minmax(300px,400px) minmax(0,1fr);gap:16px;align-items:stretch}
 .bento{display:flex;flex-direction:column;gap:12px;justify-content:center;min-width:0}
-.acard{width:100%;background:var(--card);border:1px solid var(--line);border-radius:28px;padding:36px 32px;box-shadow:var(--sh);text-align:center;animation:micro .26s cubic-bezier(.22,1,.36,1) backwards}
-@keyframes micro{from{opacity:0;transform:translateY(8px) scale(.985)}to{opacity:1;transform:none}}
-@keyframes micro-x{from{opacity:0;transform:translate(-50%,8px) scale(.985)}to{opacity:1;transform:translate(-50%,0) scale(1)}}
-@keyframes soft{from{opacity:.45}to{opacity:1}}
-.soft{animation:soft .2s cubic-bezier(.22,1,.36,1)}
-.fcard{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:16px 16px 18px;box-shadow:var(--sh);text-align:left;animation:micro .26s cubic-bezier(.22,1,.36,1) backwards;transition:transform .18s cubic-bezier(.22,1,.36,1),box-shadow .22s ease,background-color .24s ease,border-color .24s ease}
-.fcard:hover{transform:translateY(-1px)}
-.fcard .ic{width:36px;height:36px;border-radius:12px;display:grid;place-items:center;background:var(--ink);color:var(--inv);margin-bottom:10px}
-.fcard .ic svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
-.fcard h3{font-size:16px;font-weight:600;letter-spacing:-.02em}.fcard p{margin:6px 0 0;color:var(--mu);font-size:13.5px;line-height:1.4}
-.bento .lg{flex:1.4;min-height:210px;padding:22px}.bento .lg h3{font-size:22px}.bento .lg p{font-size:15px}
-.bento .md{flex:1.05;min-height:150px}.bento .sm{flex:.82;min-height:112px}
-.bento.left .fcard:nth-child(1){animation-delay:.04s}.bento.left .fcard:nth-child(2){animation-delay:.12s}.bento.left .fcard:nth-child(3){animation-delay:.2s}
-.bento.right .fcard:nth-child(1){animation-delay:.08s}.bento.right .fcard:nth-child(2){animation-delay:.16s}.bento.right .fcard:nth-child(3){animation-delay:.24s}
-@media(max-width:980px){
- .auth-wrap{display:flex;flex-direction:column;max-width:560px}
- .auth-wrap .acard{order:1}
- .bento{order:2;display:grid;grid-template-columns:1fr 1fr;align-content:start}
- .bento.right{order:3}
- .bento .lg,.bento .md,.bento .sm{min-height:0;flex:none}
- .bento .lg{grid-column:1 / -1}
-}
+.acard{width:100%;background:var(--card);border:1px solid var(--line);border-radius:28px;padding:36px 32px;box-shadow:var(--sh);text-align:center;animation:micro .24s cubic-bezier(.22,1,.36,1) backwards}
+@keyframes micro{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes micro-x{from{opacity:0;transform:translate(-50%,8px)}to{opacity:1;transform:translate(-50%,0)}}
+.fcard{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:16px;box-shadow:var(--sh);text-align:left}
+.fcard h3{font-size:16px;font-weight:600}.fcard p{margin:6px 0 0;color:var(--mu);font-size:13.5px;line-height:1.4}
+.bento .lg{flex:1.4}.bento .sm{flex:.8}
+@media(max-width:980px){.auth-wrap{display:flex;flex-direction:column;max-width:560px}.bento{display:grid;grid-template-columns:1fr 1fr}.bento .lg{grid-column:1 / -1}}
 @media(max-width:640px){.bento{grid-template-columns:1fr}}
-.acard .logo{margin:0 auto 22px;width:52px;height:52px;border-radius:15px;font-size:26px}
-.acard h1{font-size:30px;font-weight:700}.sub{color:var(--mu);margin:8px 0 24px}
+.acard img.logo{margin:0 auto 18px;width:64px;height:64px;border-radius:18px}
+.acard h1{font-size:30px;font-weight:700}.sub{color:var(--mu);margin:8px 0 22px}
 .acard form{display:grid;gap:12px}.acard input{width:100%;font-size:16px}
-.seg{display:grid;grid-template-columns:1fr 1fr;background:var(--fill);border-radius:12px;padding:3px;margin-bottom:18px}
-.seg button{background:none;border:0;border-radius:10px;padding:8px;cursor:pointer;color:var(--mu);font-weight:500;transition:background .2s ease,color .2s ease,box-shadow .2s ease,transform .18s cubic-bezier(.22,1,.36,1)}.seg button:active{transform:scale(.98)}.seg button.on{background:var(--card);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.15)}
-[data-th=dark] .seg button.on{background:#3a3a3c}
-.fe{min-height:18px;font-size:13px;text-align:left;color:var(--ink);font-weight:500}.fe.ok{color:var(--mu)}
-.or{display:flex;align-items:center;gap:12px;color:var(--mu);font-size:13px;margin:18px 0}.or:before,.or:after{content:"";flex:1;height:1px;background:var(--line)}
-.gbtn{display:flex;align-items:center;justify-content:center;gap:10px;background:var(--card);border:1px solid var(--line);border-radius:980px;padding:12px;cursor:pointer;font-weight:500;font-size:15px;transition:background .2s ease,transform .18s cubic-bezier(.22,1,.36,1),opacity .2s ease}.gbtn:hover{background:var(--fill)}.gbtn:active{transform:scale(.98)}.gbtn:disabled{opacity:.45;cursor:default;transform:none}.gbtn svg{width:18px;height:18px}
-.hint{color:var(--mu);font-size:12.5px;margin:10px 0 0}.links{margin-top:18px;font-size:14px;display:flex;justify-content:center;gap:18px}.links a{color:var(--mu)}
-/* app */
-header{display:flex;align-items:center;gap:12px;padding:12px 24px;position:sticky;top:0;z-index:5;flex-wrap:wrap;row-gap:8px;background:color-mix(in srgb,var(--bg) 72%,transparent);-webkit-backdrop-filter:saturate(180%) blur(22px);backdrop-filter:saturate(180%) blur(22px);border-bottom:1px solid var(--line);transition:background-color .24s ease,border-color .24s ease}
-header b{font-size:17px;letter-spacing:-.02em}header .sp{flex:1}#who{color:var(--mu);font-size:13px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.seg{display:grid;grid-template-columns:1fr 1fr;background:var(--fill);border-radius:12px;padding:3px;margin-bottom:16px}
+.seg button{background:none;border:0;border-radius:10px;padding:8px;cursor:pointer;color:var(--mu);font-weight:500}.seg button.on{background:var(--card);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.12)}
+.fe{min-height:18px;font-size:13px;text-align:left;color:var(--warn);font-weight:500}.fe.ok{color:var(--mu)}
+.or{display:flex;align-items:center;gap:12px;color:var(--mu);font-size:13px;margin:16px 0}.or:before,.or:after{content:"";flex:1;height:1px;background:var(--line)}
+.gbtn{display:flex;align-items:center;justify-content:center;gap:10px;background:var(--card);border:1px solid var(--line);border-radius:980px;padding:12px;cursor:pointer;font-weight:500}
+.gbtn:disabled{opacity:.45;cursor:default}
+.hint{color:var(--mu);font-size:12.5px;margin:8px 0 0}.links{margin-top:16px;font-size:14px;display:flex;justify-content:center;gap:16px;flex-wrap:wrap}.links a,.links button.link{color:var(--mu);background:none;border:0;cursor:pointer;padding:0}
+header{display:flex;align-items:center;gap:12px;padding:12px 22px;position:sticky;top:0;z-index:5;flex-wrap:wrap;background:color-mix(in srgb,var(--bg) 78%,transparent);backdrop-filter:saturate(160%) blur(18px);border-bottom:1px solid var(--line)}
+.brand{display:flex;flex-direction:column;min-width:0}.brand b{font-size:17px;letter-spacing:-.02em}.brand .tag{color:var(--mu);font-size:12.5px}
+header .sp{flex:1}#who{color:var(--mu);font-size:13px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 main{max-width:1180px;margin:0 auto;padding:28px 20px}
-#app main{min-height:calc(100vh - 78px);position:relative}
-.card{background:var(--card);border:1px solid var(--line);border-radius:24px;padding:26px;margin-bottom:16px;box-shadow:var(--sh);transition:background-color .24s ease,border-color .24s ease,box-shadow .22s ease,transform .18s cubic-bezier(.22,1,.36,1),color .24s ease}
-.card:hover{transform:translateY(-1px)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:24px;padding:26px;margin-bottom:16px;box-shadow:var(--sh);transition:background-color .2s ease,border-color .2s ease}
 .dash{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(280px,.85fr);gap:16px;align-items:start}
-.dash > .card,.dash > #prog{margin-bottom:0}
-.span2{grid-column:1 / -1}
+.dash>.card,.dash>#prog{margin-bottom:0}.span2{grid-column:1 / -1}
 .stack{display:grid;gap:16px}.stack>.card{margin-bottom:0}
-.card h3{font-size:18px;font-weight:600}
-@media(max-width:900px){.dash{grid-template-columns:1fr}header .btn{padding:6px 10px;font-size:13px}}
+@media(max-width:900px){.dash{grid-template-columns:1fr}}
 .hero-panel h2{font-size:clamp(32px,4vw,46px);line-height:1.05}
 .hero-top{display:flex;justify-content:space-between;gap:18px;align-items:flex-end;flex-wrap:wrap}
-.eyebrow{color:var(--mu);font-size:13px;font-weight:600;letter-spacing:.01em;margin:0 0 6px}
+.eyebrow{color:var(--accent);font-size:13px;font-weight:600;margin:0 0 6px}
 .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:18px}
-.metric{background:var(--fill);border-radius:16px;padding:14px 16px}
-.metric b{display:block;font-size:22px;letter-spacing:-.03em;margin-top:2px}
-.metric small{color:var(--mu)}
+.metric{background:var(--fill);border-radius:16px;padding:14px 16px}.metric b{display:block;font-size:22px;letter-spacing:-.03em;margin-top:2px}.metric small{color:var(--mu)}
 @media(max-width:640px){.metrics{grid-template-columns:1fr}}
 .drive-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
-.dcard{display:grid;grid-template-columns:auto minmax(0,1fr) auto;grid-template-areas:"ck name pct" "ck meta pct" "bar bar bar";gap:2px 14px;align-items:center;padding:16px 18px;border:1px solid var(--line);border-radius:18px;background:var(--card);cursor:pointer;text-align:left;transition:transform .18s cubic-bezier(.22,1,.36,1),border-color .2s ease,box-shadow .2s ease,background-color .24s ease}
-.dcard:hover{transform:translateY(-1px)}
-.dcard:active{transform:scale(.985)}
-.dcard:has(input:checked){border-color:var(--ink);box-shadow:0 0 0 1px var(--ink)}
+.dcard{display:grid;grid-template-columns:auto minmax(0,1fr) auto;grid-template-areas:"ck name pct" "ck meta pct" "bar bar bar";gap:2px 14px;align-items:center;padding:16px 18px;border:1px solid var(--line);border-radius:18px;background:var(--card);cursor:pointer;text-align:left}
+.dcard:has(input:checked){border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
 .dcard input{grid-area:ck}.dcard b{grid-area:name;word-break:break-all}.dcard small{grid-area:meta;color:var(--mu)}
-.dcard .pct{grid-area:pct;font-size:22px;font-weight:600;letter-spacing:-.03em}.dcard .bar{grid-area:bar;margin-top:8px}
-.kv{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-top:1px solid var(--line);font-size:13.5px}
-.kv span{color:var(--mu)}.kv b{font-weight:600;text-align:right}
-.optgrid{display:grid;gap:10px}
-.opt{border:1px solid var(--line);border-radius:16px;padding:12px 14px;background:var(--fill);transition:background-color .2s ease,border-color .2s ease}
-.opt .r{margin-top:10px}
-.mini-bento{display:grid;grid-template-columns:1.35fr 1fr .85fr;grid-auto-rows:minmax(100px,auto);gap:12px}
-.mini-bento .fcard{animation:none}
-.mini-bento .fcard:hover{transform:translateY(-1px)}
-.mini-bento .lg{grid-row:span 2;min-height:220px}
-.mini-bento .md{min-height:148px}.mini-bento .sm{min-height:100px}
-@media(max-width:800px){.mini-bento{grid-template-columns:1fr}.mini-bento .lg{grid-row:auto;min-height:0}}
-.statgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:16px}
-@media(max-width:900px){.statgrid{grid-template-columns:1fr 1fr}}
-@media(max-width:560px){.statgrid{grid-template-columns:1fr}}
-.split{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(240px,.8fr);gap:16px;margin-bottom:16px}
-@media(max-width:820px){.split{grid-template-columns:1fr}}
-.split .card,.statgrid .k{margin-bottom:0}
-button.k{display:block;width:100%;text-align:left;cursor:pointer;font:inherit;color:inherit}
-.catrow{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;align-items:center;margin-top:12px}
-.catrow b{font-size:13px;justify-self:end}.catrow .bar{grid-column:1 / -1;margin:0}
-.qacts{display:grid;gap:8px}
-.qbtn{display:flex;justify-content:space-between;align-items:center;gap:12px;width:100%;text-align:left;background:var(--fill);border:0;border-radius:14px;padding:12px 14px;cursor:pointer;font-weight:600;transition:background .2s ease,transform .18s cubic-bezier(.22,1,.36,1)}
-.qbtn:hover{background:var(--fill2)}.qbtn:active{transform:scale(.985)}
-.qbtn small{color:var(--mu);font-weight:500}
+.dcard .pct{grid-area:pct;font-size:22px;font-weight:600}.dcard .bar{grid-area:bar;margin-top:8px}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-top:1px solid var(--line);font-size:13.5px}.kv span{color:var(--mu)}.kv b{font-weight:600;text-align:right}
+.optgrid{display:grid;gap:10px}.opt{border:1px solid var(--line);border-radius:16px;padding:12px 14px;background:var(--fill)}
+.mini-bento{display:grid;grid-template-columns:1.2fr 1fr .9fr;gap:12px}
+.mini-bento .fcard{box-shadow:none}.mini-bento .lg{grid-row:span 2}
+@media(max-width:800px){.mini-bento{grid-template-columns:1fr}.mini-bento .lg{grid-row:auto}}
+.s{color:var(--mu);margin:6px 0 16px}.r{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.bar{height:6px;background:var(--fill2);border-radius:6px;overflow:hidden;margin-top:7px}.bar i{display:block;height:100%;width:0;background:var(--accent);border-radius:6px;transition:width .22s cubic-bezier(.22,1,.36,1)}
+.steps{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.st{font-size:13px;padding:4px 12px;border-radius:980px;color:var(--mu);background:var(--fill)}.st.on{background:var(--accent);color:#fff}
 .sk{position:relative;overflow:hidden;background:var(--fill2);border-radius:16px}
-.sk::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent 18%,rgba(255,255,255,.55) 50%,transparent 82%);transform:translateX(-100%);animation:shimmer 1.5s ease-in-out infinite}
-[data-th=dark] .sk::after{background:linear-gradient(100deg,transparent 18%,rgba(255,255,255,.16) 50%,transparent 82%)}
+.sk::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent 18%,rgba(255,255,255,.45) 50%,transparent 82%);transform:translateX(-100%);animation:shimmer 1.5s ease-in-out infinite}
 @keyframes shimmer{to{transform:translateX(100%)}}
-.sk-metric{height:72px;border-radius:16px}.sk-drive{height:112px;border-radius:18px}
-.sk-hero{height:148px;border-radius:28px}.sk-stat{height:108px;border-radius:22px}
-.sk-line{height:68px;margin-top:10px}.sk-line.short{width:72%}
-.sk-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:12px}
-@media(max-width:820px){.sk-stats{grid-template-columns:1fr 1fr}}
-.sk-wrap{margin-top:16px}
-.leaving{opacity:0!important;pointer-events:none;transition:opacity .22s cubic-bezier(.22,1,.36,1),transform .22s cubic-bezier(.22,1,.36,1)}
-#auth.leaving,#app.leaving,#intro.leaving,#modal.leaving,#drv.leaving,#disksum.leaving,#view.leaving{transform:translateY(6px) scale(.985)}
-#scan.leaving,#res.leaving{position:absolute;z-index:4;left:20px;right:20px;top:28px;transform:translateY(6px) scale(.985)}
-#toast.leaving,#act.leaving{transform:translate(-50%,8px) scale(.985)}
-.in:not(#toast):not(#act):not(#app):not(#view):not(#drv):not(#disksum):not(#scan):not(#res):not(#auth){animation:micro .24s cubic-bezier(.22,1,.36,1) backwards}
-#disksum.in>*{animation:micro .24s cubic-bezier(.22,1,.36,1) backwards}
-#disksum.in>*:nth-child(2){animation-delay:.05s}#disksum.in>*:nth-child(3){animation-delay:.1s}
-.k,.grp{transition:transform .18s cubic-bezier(.22,1,.36,1),box-shadow .22s ease,background-color .24s ease,border-color .24s ease}
-.k:hover,.grp:hover{transform:translateY(-1px)}
-#toast.in,#act.in{animation:micro-x .24s cubic-bezier(.22,1,.36,1) backwards}
-#app.in > header{animation:micro .24s cubic-bezier(.22,1,.36,1) backwards}
-#app.in .hero-panel{animation:micro .26s cubic-bezier(.22,1,.36,1) .02s backwards}
-#app.in .drives-card{animation:micro .26s cubic-bezier(.22,1,.36,1) .07s backwards}
-#app.in .status-card{animation:micro .26s cubic-bezier(.22,1,.36,1) .12s backwards}
-#app.in .quick-card{animation:micro .26s cubic-bezier(.22,1,.36,1) .17s backwards}
-#app.in .about-card{animation:micro .26s cubic-bezier(.22,1,.36,1) .22s backwards}
-#drv.in .dcard{animation:micro .24s cubic-bezier(.22,1,.36,1) backwards}
-#drv.in .dcard:nth-child(2){animation-delay:.04s}#drv.in .dcard:nth-child(3){animation-delay:.08s}
-#drv.in .dcard:nth-child(4){animation-delay:.12s}#drv.in .dcard:nth-child(5){animation-delay:.16s}
-#drv.in .dcard:nth-child(n+6){animation-delay:.2s}
-#view.in > *{animation:micro .24s cubic-bezier(.22,1,.36,1) backwards}
-#view.in > *:nth-child(2){animation-delay:.04s}#view.in > *:nth-child(3){animation-delay:.08s}
-#view.in > *:nth-child(4){animation-delay:.12s}#view.in > *:nth-child(5){animation-delay:.16s}
-#view.in > *:nth-child(n+6){animation-delay:.2s}
-#modal{opacity:1;transition:opacity .22s cubic-bezier(.22,1,.36,1)}
-#modal.leaving{opacity:0}
-h2{font-size:26px;font-weight:700}.s{color:var(--mu);margin:6px 0 16px}
-.r{display:flex;flex-wrap:wrap;gap:10px;align-items:center}.r+.r{margin-top:12px}
-.bar{height:6px;background:var(--fill2);border-radius:6px;overflow:hidden;margin-top:7px}.bar i{display:block;height:100%;width:0;background:var(--ink);border-radius:6px;transition:width .26s cubic-bezier(.22,1,.36,1)}
-.steps{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.st{font-size:13px;padding:4px 12px;border-radius:980px;color:var(--mu);background:var(--fill);transition:background .22s ease,color .22s ease}.st.on{background:var(--ink);color:var(--inv)}
-.lay{display:grid;grid-template-columns:220px 1fr;gap:24px}@media(max-width:820px){.lay{grid-template-columns:1fr}.nav{flex-direction:row!important;flex-wrap:wrap;position:static!important}}
+.sk-metric{height:72px}.sk-drive{height:112px;border-radius:18px}.sk-hero{height:120px;border-radius:20px}.sk-line{height:56px;margin-top:10px}
+.lay{display:grid;grid-template-columns:210px 1fr;gap:22px}@media(max-width:820px){.lay{grid-template-columns:1fr}.nav{flex-direction:row!important;flex-wrap:wrap;position:static!important}}
 .nav{display:flex;flex-direction:column;gap:2px;align-self:start;position:sticky;top:76px}
-.nv{display:flex;justify-content:space-between;gap:8px;text-align:left;background:none;border:0;color:var(--mu);padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:500;transition:background .2s ease,color .2s ease,transform .18s cubic-bezier(.22,1,.36,1)}.nv:hover{background:var(--fill)}.nv:active{transform:scale(.98)}.nv.on{background:var(--ink);color:var(--inv)}
+.nv{display:flex;justify-content:space-between;gap:8px;text-align:left;background:none;border:0;color:var(--mu);padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:500}.nv:hover{background:var(--fill)}.nv.on{background:var(--ink);color:var(--inv)}
 .nv em{font-style:normal;font-size:12px;opacity:.7}
-.hero{background:var(--ink);color:var(--inv);border-radius:28px;padding:36px 32px;margin-bottom:16px}.hero small{opacity:.65;font-size:14px}.hero big{font-size:clamp(48px,8vw,84px);font-weight:700;display:block;line-height:1.02;letter-spacing:-.045em;margin:6px 0 10px}.hero p{opacity:.65;margin:0;max-width:620px}
-.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:16px}
-.k{border:1px solid var(--line);border-radius:22px;padding:20px;background:var(--card);box-shadow:var(--sh)}.k b{font-size:28px;display:block;letter-spacing:-.03em;margin-bottom:12px}.k small{color:var(--mu);display:block;margin-bottom:2px}
-.row{display:grid;grid-template-columns:28px 160px 1fr 140px 90px;gap:14px;align-items:center;padding:14px 4px;border-top:1px solid var(--line)}.row.nc{grid-template-columns:160px 1fr 140px 90px}
+.hero{background:var(--ink);color:var(--inv);border-radius:28px;padding:32px;margin-bottom:16px}.hero small{opacity:.7;font-size:14px}.hero big{font-size:clamp(42px,7vw,72px);font-weight:700;display:block;line-height:1.02;letter-spacing:-.04em;margin:6px 0 10px}.hero p{opacity:.75;margin:0;max-width:640px}
+.statgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
+@media(max-width:900px){.statgrid{grid-template-columns:1fr 1fr}}
+button.k,.k{border:1px solid var(--line);border-radius:20px;padding:18px;background:var(--card);box-shadow:var(--sh);text-align:left;cursor:pointer;color:inherit;width:100%}
+.k b{font-size:26px;display:block;letter-spacing:-.03em}.k small{color:var(--mu)}
+.row{display:grid;grid-template-columns:28px 150px 1fr 130px 90px;gap:12px;align-items:center;padding:14px 4px;border-top:1px solid var(--line)}
+.row.nc{grid-template-columns:150px 1fr 130px 90px}
 @media(max-width:820px){.row,.row.nc{grid-template-columns:1fr}}
-.pill{font-size:12px;font-weight:600;padding:3px 11px;border-radius:980px;justify-self:start;white-space:nowrap;border:1px solid transparent;display:inline-block}
-.p-g{border:1px dashed var(--ink)}.p-s{background:var(--ink);color:var(--inv)}.p-l{background:var(--fill2)}.p-m{border-color:var(--ink)}.p-h{background:var(--fill);border-color:var(--line)}
-.nm small{display:block;color:var(--mu);word-break:break-all}.nm b{word-break:break-all;font-weight:600}
-.grp{border:1px solid var(--line);border-radius:18px;padding:14px 16px;margin-bottom:10px}.cp{display:grid;grid-template-columns:24px 1fr auto;gap:10px;align-items:center;margin-top:9px;color:var(--mu);word-break:break-all}
-.warn{background:var(--fill);border-radius:16px;padding:14px 18px;margin-bottom:14px}
+.pill{font-size:12px;font-weight:600;padding:3px 10px;border-radius:980px;white-space:nowrap;display:inline-block}
+.p-g{background:rgba(15,110,107,.12);color:var(--accent)}.p-s{background:var(--warn);color:#fff}.p-l{background:var(--sand);color:#111114}.p-m{border:1px solid var(--accent);color:var(--accent)}.p-h{background:var(--fill2);color:var(--ink)}
+.nm small{display:block;color:var(--mu);word-break:break-all}.nm b{word-break:break-all}
+.grp{border:1px solid var(--line);border-radius:18px;padding:14px 16px;margin-bottom:10px}
+.cp{display:grid;grid-template-columns:24px 1fr auto;gap:10px;align-items:center;margin-top:8px;color:var(--mu);word-break:break-all}
+.warn{background:rgba(194,65,12,.08);border:1px solid rgba(194,65,12,.25);border-radius:16px;padding:14px 18px;margin-bottom:14px;color:var(--ink)}
 .leg{display:grid;gap:10px}.leg div{display:flex;gap:12px;align-items:center;color:var(--mu)}
-#act{position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 20px);transform:translateX(-50%);background:var(--ink);color:var(--inv);border-radius:980px;padding:10px 12px 10px 24px;display:flex;gap:14px;align-items:center;box-shadow:0 14px 50px rgba(0,0,0,.35);z-index:9;white-space:nowrap;transition:opacity .22s cubic-bezier(.22,1,.36,1),transform .22s cubic-bezier(.22,1,.36,1)}
-#act .btn{background:color-mix(in srgb,var(--inv) 18%,transparent);color:var(--inv)}#act .dng{background:var(--inv);color:var(--ink);border:0;border-radius:980px;padding:9px 18px;cursor:pointer;font-weight:600;transition:transform .18s cubic-bezier(.22,1,.36,1),opacity .2s ease}#act .dng:hover{opacity:.88}#act .dng:active{transform:scale(.98)}
-#toast{position:fixed;left:50%;top:70px;transform:translateX(-50%);background:var(--ink);color:var(--inv);border-radius:16px;padding:12px 20px;z-index:200;max-width:min(440px,92vw);box-shadow:0 14px 50px rgba(0,0,0,.3)}
-#modal{position:fixed;inset:0;background:rgba(0,0,0,.45);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);z-index:150;display:grid;place-items:center;padding:20px}
-.sheet{background:var(--card);border-radius:24px;padding:28px;max-width:400px;width:100%;box-shadow:0 30px 80px rgba(0,0,0,.35);animation:micro .24s cubic-bezier(.22,1,.36,1) backwards}.sheet h3{font-size:20px}.sheet p{color:var(--mu);white-space:pre-line;margin:10px 0 22px}.sb{display:flex;gap:10px;justify-content:flex-end}.sb .pri{padding:10px 22px;font-size:15px}
-#app.in .mini-bento .fcard{animation:micro .24s cubic-bezier(.22,1,.36,1) backwards}
-#app.in .mini-bento .fcard:nth-child(1){animation-delay:.04s}#app.in .mini-bento .fcard:nth-child(2){animation-delay:.08s}
-#app.in .mini-bento .fcard:nth-child(3){animation-delay:.12s}#app.in .mini-bento .fcard:nth-child(4){animation-delay:.16s}
-#app.in .mini-bento .fcard:nth-child(5){animation-delay:.2s}
+#act{position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 18px);transform:translateX(-50%);background:var(--ink);color:var(--inv);border-radius:980px;padding:10px 12px 10px 22px;display:flex;gap:12px;align-items:center;z-index:9;white-space:nowrap}
+#act .btn{background:transparent;color:var(--inv);border:1px solid rgba(243,238,230,.3)}
+#act .dng{background:var(--warn);color:#fff;border:0;border-radius:980px;padding:9px 16px;cursor:pointer;font-weight:600}
+#toast{position:fixed;left:50%;top:70px;transform:translateX(-50%);background:var(--ink);color:var(--inv);border-radius:16px;padding:12px 18px;z-index:200;max-width:min(480px,92vw)}
+#toast button{margin-left:10px}
+#modal{position:fixed;inset:0;background:rgba(17,17,20,.45);backdrop-filter:blur(6px);z-index:150;display:grid;place-items:center;padding:20px}
+.sheet{background:var(--card);border-radius:24px;padding:26px;max-width:440px;width:100%;box-shadow:0 24px 70px rgba(0,0,0,.28)}
+.sheet.wide{max-width:560px}.sheet h3{font-size:20px}.sheet p{color:var(--mu);white-space:pre-line;margin:8px 0 16px}
+.sb{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}
+.banner{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin:0 auto;max-width:1180px;padding:10px 18px;background:var(--card);border-bottom:1px solid var(--line);color:var(--ink)}
+.banner a{font-weight:600}
+.maplay{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(230px,.7fr);gap:16px}
+@media(max-width:860px){.maplay{grid-template-columns:1fr}}
+#mapdraw svg{width:100%;height:auto;display:block}
+#mapdraw .seg{cursor:pointer;transition:opacity .18s ease}
+#mapdraw .seg:hover{opacity:.78}
+.mhub{fill:var(--fill2)}
+#tip{position:fixed;z-index:80;background:var(--ink);color:var(--inv);border-radius:12px;padding:8px 12px;font-size:13px;pointer-events:none;max-width:280px}
+.glib{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+.gcard{border:1px solid var(--line);border-radius:18px;padding:16px;background:var(--card)}
+.gcard b{display:block;font-size:16px;margin-bottom:4px}.gcard p{margin:4px 0;color:var(--mu);font-size:13.5px}
+.setrow{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px 0;border-top:1px solid var(--line)}
+.setrow p{margin:4px 0 0;color:var(--mu);font-size:13px}
+.hitem{padding:8px 0;border-top:1px solid var(--line);font-size:13.5px}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
 <div id=intro class=intro hidden>
- <button class=skip id=skip>Salta</button>
+ <button class=skip id=skip data-k=intro.skip>Salta</button>
  <div class=slides>
-  <div class="slide on"><div class=mark>T</div><h1>Twenties<br>Cleaning</h1><p>Lo spazio del tuo computer, finalmente in ordine.</p></div>
-  <div class=slide><svg viewBox="0 0 48 48"><path d="M3 24s7.5-13 21-13 21 13 21 13-7.5 13-21 13S3 24 3 24z"/><circle cx="24" cy="24" r="6"/></svg><h2>Vedi tutto.<br>Non tocchi niente.</h2><p>L'analisi è in sola lettura. Trova cache, doppioni e archivi già estratti senza modificare nulla.</p></div>
-  <div class=slide><svg viewBox="0 0 48 48"><path d="M8 13h32M18 13V8h12v5M12 13l2 28h20l2-28M20 20v14M28 20v14"/></svg><h2>Poi decidi tu.</h2><p>Ogni file va nel Cestino solo dopo la tua conferma. Resta sempre recuperabile.</p></div>
+  <div class="slide on"><img src="/logo.svg" alt=""><h1 data-k=intro.1.title>Vedi cosa pesa.</h1><p data-k=intro.1.body></p></div>
+  <div class=slide><h2 data-k=intro.2.title>Non tocca da solo.</h2><p data-k=intro.2.body></p></div>
+  <div class=slide><h2 data-k=intro.3.title>Nel Cestino.</h2><p data-k=intro.3.body></p></div>
  </div>
- <div class=foot><div class=dots id=dots></div><button class=pri id=nx>Continua</button></div>
+ <div class=foot><div class=dots id=dots></div><button class=pri id=nx data-k=intro.next>Continua</button></div>
 </div>
 <div id=auth hidden></div>
+<div id=upd class=banner hidden></div>
 <div id=app hidden>
-<header><div class=logo>T</div><b>Twenties Cleaning</b><span class=sp></span><span id=who></span>
-<button class=btn id=again hidden>Nuova analisi</button><button class=btn id=th title="Tema chiaro/scuro" aria-label="Tema">Tema</button><button class=btn id=out>Esci dall'account</button><button class=btn id=del>Elimina account</button><button class=btn id=quit>Chiudi app</button></header>
+<header><img class=logo src="/logo.svg" alt=""><div class=brand><b data-k=app.name>Twenties</b><span class=tag data-k=tagline>Vedi cosa pesa. Decidi tu.</span></div><span class=sp></span><span id=who></span>
+<button class=btn id=again hidden data-k=again>Nuova analisi</button><button class=btn id=gear data-k=settings>Impostazioni</button><button class=btn id=th data-k=theme>Tema</button><button class=btn id=acct data-k=account>Account</button><button class=btn id=quit data-k=quit>Chiudi</button></header>
 <main>
 <div id=scan>
 <div class=dash>
  <section class="card hero-panel span2">
   <div class=hero-top>
-   <div><p class=eyebrow id=greet>Il tuo computer</p><h2>Analizza lo spazio</h2><p class=s>Scegli i dischi da controllare. L'analisi è in sola lettura: non modifica e non cancella nulla.</p></div>
-   <button class=pri id=go>Avvia analisi</button>
+   <div><p class=eyebrow id=greet></p><h2 data-k=hero.title>Vedi cosa pesa.</h2><p class=s data-k=hero.body></p></div>
+   <button class=pri id=go data-k=go>Avvia analisi</button>
   </div>
   <div class=metrics id=disksum><div class="sk sk-metric"></div><div class="sk sk-metric"></div><div class="sk sk-metric"></div></div>
  </section>
  <section class="card drives-card">
-  <h3>Dischi</h3><p class=s id=pick>Lettura dei dischi di questo computer…</p>
-  <div class=drive-grid id=drv><div class="sk sk-drive"></div><div class="sk sk-drive"></div><div class="sk sk-drive"></div></div>
+  <h3 data-k=disks>Dischi</h3><p class=s id=pick></p>
+  <div class=drive-grid id=drv><div class="sk sk-drive"></div><div class="sk sk-drive"></div></div>
  </section>
  <div class=stack>
-  <section class="card status-card"><h3>Stato del sistema</h3><div id=sys style="margin-top:8px"></div></section>
+  <section class=card id=sched hidden></section>
+  <section class="card status-card"><h3 data-k=status.title>Stato</h3><div id=sys style="margin-top:8px"></div></section>
   <section class="card quick-card">
-   <h3>Azioni rapide</h3><p class=s>Opzioni dell'analisi. I doppioni partono dalla dimensione che indichi.</p>
+   <h3 data-k=quick.title>Come analizzare</h3><p class=s data-k=quick.hint></p>
    <div class=optgrid>
-    <div class=opt><label class=chip><input type=checkbox id=dups checked>Cerca doppioni</label><div class=r><span class=s style="margin:0">solo file da</span><input type=number id=minmb value=5 min=1 style="width:84px"><span class=s style="margin:0">MB in su</span></div></div>
-    <div class=opt><label class=chip><input type=checkbox id=arch checked>Cerca archivi già estratti</label><p class=s style="margin:8px 0 0">RAR, ZIP, 7z e TAR il cui contenuto è già sul disco.</p></div>
-    <div class=opt><input type=text id=custom placeholder="Cartella specifica da aggiungere (facoltativo)" style="width:100%"></div>
+    <div class=opt><label class=chip><input type=checkbox id=dups checked><span data-k=opt.dups>Doppioni esatti</span></label><div class=r><span class=s style="margin:0" data-k=opt.dups_from>solo file da</span><input type=number id=minmb value=5 min=1 style="width:84px"><span class=s style="margin:0">MB</span></div><p class=s style="margin:8px 0 0" data-k=opt.dups_why></p></div>
+    <div class=opt><label class=chip><input type=checkbox id=arch checked><span data-k=opt.arch>Archivi già estratti</span></label><p class=s style="margin:8px 0 0" data-k=opt.arch_hint></p></div>
+    <div class=opt><input type=text id=custom data-ph=opt.folder placeholder="" style="width:100%"></div>
    </div>
   </section>
  </div>
  <section class="card about-card span2">
-  <h3>Cosa controlla l'analisi</h3><p class=s>Solo ciò che il programma sa fare. Nessun dato inventato.</p>
+  <h3 data-k=about.title>Cosa guarda</h3><p class=s data-k=about.body></p>
   <div class=mini-bento>
-   <article class="fcard lg"><div class=ic><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg></div><h3>Cartelle</h3><p>Raggruppa le cartelle da almeno 100 MB e le etichetta in base al contenuto: gioco, scarto o importanza.</p></article>
-   <article class="fcard md"><div class=ic><svg viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></svg></div><h3>File grandi</h3><p>Elenca fino a 400 file più pesanti, con una spiegazione per ciascuno.</p></article>
-   <article class="fcard sm"><div class=ic><svg viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="10" rx="2"/><path d="M8 8V6h8v2"/></svg></div><h3>Giochi</h3><p>Riconosce Steam, Epic, GOG, Riot, Ubisoft, EA e Xbox.</p></article>
-   <article class="fcard md"><div class=ic><svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M4 16V6a2 2 0 0 1 2-2h10"/></svg></div><h3>Doppioni</h3><p>Confronta il contenuto e tiene sempre almeno una copia. Soglia iniziale: 5 MB.</p></article>
-   <article class="fcard sm"><div class=ic><svg viewBox="0 0 24 24"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 7v10l9 4 9-4V7"/></svg></div><h3>Archivi</h3><p>ZIP e TAR sempre. RAR e 7z se trovi 7-Zip o UnRAR.</p></article>
+   <article class="fcard lg"><h3 data-k=about.folders.t></h3><p data-k=about.folders.d></p></article>
+   <article class="fcard"><h3 data-k=about.files.t></h3><p data-k=about.files.d></p></article>
+   <article class="fcard"><h3 data-k=about.games.t></h3><p data-k=about.games.d></p></article>
+   <article class="fcard"><h3 data-k=about.dups.t></h3><p data-k=about.dups.d></p></article>
+   <article class="fcard"><h3 data-k=about.arch.t></h3><p data-k=about.arch.d></p></article>
   </div>
  </section>
- <div id=prog class="card span2" hidden aria-busy=true>
-  <h3>Analisi in corso</h3><p class=s>Il controllo continua in background: questa finestra resta utilizzabile.</p>
+ <div id=prog class="card span2" hidden>
+  <h3 data-k=prog.title>Analisi in corso</h3><p class=s data-k=prog.body></p>
   <div class=steps id=steps></div>
   <div id=msg class=s style="word-break:break-all;margin:0"></div>
   <div class=bar id=bar hidden><i></i></div>
-  <div class=sk-wrap aria-hidden=true>
-   <div class="sk sk-hero"></div>
-   <div class=sk-stats><div class="sk sk-stat"></div><div class="sk sk-stat"></div><div class="sk sk-stat"></div><div class="sk sk-stat"></div></div>
-   <div class="sk sk-line"></div><div class="sk sk-line"></div><div class="sk sk-line short"></div>
-  </div>
+  <div class=sk-wrap><div class="sk sk-hero"></div><div class="sk sk-line"></div></div>
  </div>
 </div>
 </div>
 <div id=res hidden><div class=lay><nav class=nav id=nav></nav><section id=view></section></div></div>
 </main>
 <div id=act hidden></div></div>
-<div id=modal hidden></div><div id=toast hidden></div>
+<div id=modal hidden></div><div id=toast hidden></div><div id=tip hidden></div>
 <script nonce="__NONCE__">
 "use strict";
+const I18N = __I18N__;
+let LANG="it";
+function t(k){const a=(I18N[LANG]||I18N.it||{});return a[k]||(I18N.it||{})[k]||k}
+function tf(k,o){let s=t(k);if(o)Object.keys(o).forEach(n=>{s=s.split("{"+n+"}").join(String(o[n]))});return s}
+function applyLang(){document.documentElement.lang=LANG;document.title=t("app.name");
+ document.querySelectorAll("[data-k]").forEach(el=>{el.textContent=t(el.dataset.k)});
+ document.querySelectorAll("[data-ph]").forEach(el=>{el.placeholder=t(el.dataset.ph)})}
+const SHOT=new URLSearchParams(location.search).get("shot")||"";
 function outside(u){try{const x=new URL(String(u),location.href);return (x.protocol==="http:"||x.protocol==="https:")&&x.host!==location.host}catch(e){return false}}
 document.addEventListener("click",e=>{let n=e.target;while(n&&n!==document){if(n.tagName==="A"&&n.href)break;n=n.parentNode}if(!n||n===document||!outside(n.href))return;const api=window.pywebview&&window.pywebview.api;if(!api||!api.open_external)return;e.preventDefault();e.stopPropagation();api.open_external(n.href)},true);
-const _open=window.open;window.open=function(u){const api=window.pywebview&&window.pywebview.api;if(outside(u)&&api&&api.open_external){api.open_external(String(u));return null}return _open?_open.apply(window,arguments):null};
 const CATS=["Gioco","Scarto","Importanza bassa","Importanza media","Importanza elevata"];
+const CK={"Gioco":"cat.gioco","Scarto":"cat.scarto","Importanza bassa":"cat.bassa","Importanza media":"cat.media","Importanza elevata":"cat.elevata"};
 const PC={"Gioco":"p-g","Scarto":"p-s","Importanza bassa":"p-l","Importanza media":"p-m","Importanza elevata":"p-h"};
-const LEG={"Gioco":"File di giochi. Non toccarli: se non servono, disinstalla dal launcher.","Scarto":"Cache, temporanei, log: di solito eliminabili.","Importanza bassa":"Roba vecchia o riscaricabile (ISO, vecchi video, installer).","Importanza media":"Contenuti recenti e programmi installati.","Importanza elevata":"Documenti, foto, progetti e sistema: da conservare."};
-const LV={ok:["Già estratto","p-s"],part:["Estratto in parte","p-m"],guess:["Da verificare","p-g"]};
-const NAV=[["home","Panoramica"],["folders","Cartelle"],["games","Giochi"],["files","File grandi"],["dups","Doppioni"],["arch","Archivi già estratti"]];
-const STEPS={scan:"1 · Lettura dei dischi",agg:"2 · Calcolo cartelle",dups:"3 · Ricerca doppioni",arch:"4 · Verifica archivi"};
-const INTRO={folders:"Le cartelle che occupano più spazio. Una cartella piena di file piccoli compare come un'unica voce, con il peso totale.",games:"I giochi trovati e lo spazio che occupano.",files:"I singoli file più pesanti. Puoi selezionarli e spostarli nel Cestino.",dups:"Gruppi di file identici. Per sicurezza di ogni gruppo resta sempre almeno una copia.",arch:"Archivi di cui ho verificato che il contenuto è già stato estratto: l'archivio è un doppione e si può eliminare."};
-const EMSG={google_off:"L'accesso con Google non è configurato.",google_fail:"Accesso con Google non riuscito. Riprova.",rate:"Troppi tentativi. Riprova tra qualche minuto."};
-const GSVG='<svg viewBox="0 0 24 24"><text x="12" y="18" text-anchor="middle" font-size="19" font-weight="700" fill="currentColor" font-family="Arial,sans-serif">G</text></svg>';
-const OSN={mac:{perm:"Per includere le cartelle protette, concedi l'Accesso completo al disco a Twenties Cleaning (o al Terminale, se la avvii da script) in Impostazioni di Sistema › Privacy e sicurezza, poi riavvia l'app.",tool:"Per leggere i file RAR e 7z installa <b>7-Zip</b> (da Terminale: brew install sevenzip). ZIP e TAR vengono verificati comunque.",show:"Mostra nel Finder"},win:{perm:"Avvia il programma come Amministratore per includerle.",tool:"Per verificare il contenuto dei file RAR e 7z installa <b>7-Zip</b> o <b>WinRAR</b>. Gli archivi ZIP e TAR vengono verificati comunque.",show:"Mostra"},linux:{perm:"Avvia il programma con i permessi adeguati per includerle.",tool:"Per verificare i file RAR e 7z installa <b>7-Zip</b>. ZIP e TAR vengono verificati comunque.",show:"Mostra"}};
+const WHY={"gioco rilevato (cartella di launcher o file del motore di gioco)":"why.game","cache, temporanei o log: di solito eliminabili":"why.junk","sistema: non toccare":"why.sys","programma installato (si rimuove trascinando l'app nel Cestino)":"why.prog.mac","programma installato (si rimuove dalle Impostazioni)":"why.prog.win","prevalentemente file temporanei, log o backup":"why.mostlyjunk","documenti, foto o progetti personali":"why.docs","cartella Download: spesso roba riscaricabile, controlla":"why.down","immagini disco, ISO o macchine virtuali":"why.iso","video/audio/archivi non toccati da 2+ anni":"why.oldmedia","video, audio o archivi":"why.media","contenuto misto, non toccato da 2+ anni":"why.oldmix","contenuto misto, usato di recente":"why.mix","file di un gioco":"why.gamefile","temporaneo, cache, log o backup":"why.temp","installer scaricato, riscaricabile":"why.inst","file di sistema":"why.sysfile","documento, foto o progetto personale":"why.doc","immagine disco/ISO, di solito riscaricabile":"why.isofile","media/archivio vecchio o in Download":"why.oldfile","video, audio o archivio":"why.mediafile","tipo sconosciuto, non modificato da 2+ anni":"why.oldunk","tipo sconosciuto, usato di recente":"why.unk"};
+const NAV=[["home","nav.home"],["map","nav.map"],["folders","nav.folders"],["games","nav.games"],["files","nav.files"],["dups","nav.dups"],["arch","nav.arch"]];
+const STEPK={scan:"step.scan",agg:"step.agg",dups:"step.dups",arch:"step.arch"};
 let ME=null,CSRF="",GOOGLE=false,MAIL=false,PLAT="linux",RT="",AMODE="login",FLASH=null,scanned=null;
 let R=null,tab="home",filt="Tutti",q="",sortk="size",sel=new Set(),running=false,timer,AM={},SZ={};
+let UPDATES=false,SCHED={enabled:false,due:false,days:7},mapMode="sun",mapFocus="",mapStack=[];
 const $=s=>document.querySelector(s);
-const esc=s=>String(s).replace(/[&<>"'`]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;"}[c]));
-const fmt=n=>{const u=["B","KB","MB","GB","TB"];let i=0;while(n>=1024&&i<4){n/=1024;i++}return (i?n.toFixed(1):n)+" "+u[i]};
-const pill=(t,c)=>`<span class="pill ${c}">${esc(t)}</span>`;
-const dt=t=>t?new Date(t*1000).toLocaleDateString("it"):"";
-const MOTION=220,REDUCE=()=>matchMedia("(prefers-reduced-motion: reduce)").matches;
-function hideAnimated(el,fn){
- if(!el||el.hidden){fn&&fn();return}
- if(REDUCE()){el.hidden=true;el.classList.remove("leaving");fn&&fn();return}
- const token=(el._tok=(el._tok||0)+1);
- el.classList.add("leaving");
- setTimeout(()=>{if(el._tok!==token)return;el.hidden=true;el.classList.remove("leaving");fn&&fn()},MOTION)}
+const esc=s=>String(s==null?"":s).replace(/[&<>"'`]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;"}[c]));
+const fmt=n=>{n=Number(n)||0;const u=["B","KB","MB","GB","TB"];let i=0;while(n>=1024&&i<4){n/=1024;i++}return (i?n.toFixed(1):n)+" "+u[i]};
+const loc=()=>LANG==="en"?"en":"it";
+const dt=v=>v?new Date(v*1000).toLocaleDateString(loc()):"";
+const pill=(cat)=>`<span class="pill ${PC[cat]||""}">${esc(t(CK[cat]||"cat.media"))}</span>`;
+function whyOf(x){if(!x)return "";if(x.why_code==="arch.ok")return tf("arch.ok",{n:x.why_n,where:x.why_where});if(x.why_code==="arch.part")return tf("arch.part",{p:Math.round((x.why_ratio||0)*100),where:x.why_where});if(x.why_code==="arch.guess")return t("arch.guess");const k=WHY[x.why];return k?t(k):(x.why||"")}
+const MOTION=200,REDUCE=()=>matchMedia("(prefers-reduced-motion: reduce)").matches;
+function hideAnimated(el,fn){if(!el||el.hidden){fn&&fn();return}if(REDUCE()){el.hidden=true;el.classList.remove("leaving");fn&&fn();return}const token=(el._tok=(el._tok||0)+1);el.classList.add("leaving");setTimeout(()=>{if(el._tok!==token)return;el.hidden=true;el.classList.remove("leaving");fn&&fn()},MOTION)}
 function showIn(el){if(!el||REDUCE())return;el.classList.remove("in");void el.offsetWidth;el.classList.add("in")}
-function setText(el,text){if(!el||el.textContent===text)return;el.textContent=text;if(REDUCE())return;el.classList.remove("soft");void el.offsetWidth;el.classList.add("soft")}
-const IC={
- eye:'<svg viewBox="0 0 24 24"><path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="2.5"/></svg>',
- copy:'<svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M4 16V6a2 2 0 0 1 2-2h10"/></svg>',
- box:'<svg viewBox="0 0 24 24"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 7v10l9 4 9-4V7"/><path d="M12 11v10"/></svg>',
- trash:'<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13"/></svg>',
- lock:'<svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>',
- tag:'<svg viewBox="0 0 24 24"><path d="M3 12V4h8l10 10-8 8L3 12z"/><circle cx="8" cy="8" r="1.2" fill="currentColor" stroke="none"/></svg>'};
-const FEATURES={
- left:[["lg",IC.eye,"Vede tutto, non tocca niente","L'analisi è in sola lettura: cartelle, file grandi e giochi, senza modificare nulla sul disco."],["sm",IC.copy,"Doppioni verificati","Confronta il contenuto dei file e lascia sempre almeno una copia."],["sm",IC.box,"Archivi già estratti","Controlla ZIP, TAR, RAR e 7z il cui contenuto è già presente."]],
- right:[["md",IC.trash,"Solo nel Cestino","Si sposta solo ciò che selezioni, e solo dopo una conferma. Resta recuperabile."],["md",IC.lock,"Resta sul computer","Funziona in locale, su questo PC. I file non vengono inviati da nessuna parte."],["sm",IC.tag,"Etichette chiare","Gioco, scarto, importanza bassa, media o elevata."]]};
-function fcard(sz,icon,title,desc){return `<article class="fcard ${sz}"><div class=ic>${icon}</div><h3>${esc(title)}</h3><p>${esc(desc)}</p></article>`}
-function side(list){return list.map(x=>fcard(x[0],x[1],x[2],x[3])).join("")}
-function toast(h,ms=6000){const t=$("#toast");clearTimeout(t._t);t.textContent=h;t._tok=(t._tok||0)+1;t.hidden=false;t.classList.remove("leaving");showIn(t);t._t=setTimeout(()=>hideAnimated(t),ms)}
-async function api(u,b){
- const o=b===undefined?{credentials:"same-origin"}:{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF},body:JSON.stringify(b)};
- let r,j;try{r=await fetch(u,o);j=await r.json()}catch(e){return{error:"Connessione al programma non riuscita.",_s:0}}
- if(j&&typeof j==="object")j._s=r.status;
- if(r.status===401&&ME&&u!=="/api/login"){ME=null;stopPoll();showAuth("login");toast("Sessione scaduta. Accedi di nuovo.")}
- return j}
-async function googleGo(){const r=await api("/api/google_begin",{});
- if(!r||r.error){toast(r&&r.error?r.error:"Accesso con Google non disponibile");return}
- if(r.same){location.href="/auth/google";return}
- toast("Completa l'accesso nel browser, poi torna qui…",300000);
- for(let i=0;i<150;i++){await new Promise(z=>setTimeout(z,2000));const q=await api("/api/google_poll",{ticket:r.ticket});
-  if(q&&q.ready){location.replace("/auth/finish?t="+encodeURIComponent(r.ticket));return}
-  if(q&&q.error){toast("Accesso con Google non riuscito. Riprova.");return}}
- toast("Tempo scaduto. Riprova.")}
-function ask(title,body,ok){return new Promise(res=>{const m=$("#modal");m.innerHTML=`<div class=sheet role=dialog aria-modal=true><h3>${esc(title)}</h3><p>${esc(body)}</p><div class=sb><button type=button class=btn data-m=0>Annulla</button><button type=button class=pri data-m=1>${esc(ok)}</button></div></div>`;m._tok=(m._tok||0)+1;m.hidden=false;m.classList.remove("leaving");const done=v=>hideAnimated(m,()=>{m.innerHTML="";m.onclick=null;res(v)});m.onclick=e=>{const b=e.target.closest("[data-m]");if(b)done(b.dataset.m==="1");else if(e.target===m)done(false)};m.querySelector(".pri").focus()})}
-/* intro */
+function os(k){const p=PLAT==="mac"||PLAT==="win"?PLAT:"linux";return t(k+"."+p)}
+function toast(h,ms){const el=$("#toast");clearTimeout(el._t);el.textContent=h;el.hidden=false;el._t=setTimeout(()=>{el.hidden=true},ms||5000)}
+function toastUndo(h,id){const el=$("#toast");clearTimeout(el._t);el.innerHTML="";el.append(document.createTextNode(h));if(id){const b=document.createElement("button");b.className="btn";b.textContent=t("settings.undo");b.onclick=()=>doUndo(id);el.append(b)}el.hidden=false;el._t=setTimeout(()=>{el.hidden=true},9000)}
+async function api(u,b){const o=b===undefined?{credentials:"same-origin"}:{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF},body:JSON.stringify(b)};let r,j;try{r=await fetch(u,o);j=await r.json()}catch(e){return{error:t("err.offline"),_s:0}}if(j&&typeof j==="object")j._s=r.status;if(r.status===401&&ME&&u!=="/api/login"){ME=null;stopPoll();showAuth("login");toast(t("session.expired"))}return j}
+async function googleGo(){const r=await api("/api/google_begin",{});if(!r||r.error){toast(r&&r.error?r.error:t("auth.google.off"));return}if(r.same){location.href="/auth/google";return}toast(t("google.wait"),300000);for(let i=0;i<150;i++){await new Promise(z=>setTimeout(z,2000));const q=await api("/api/google_poll",{ticket:r.ticket});if(q&&q.ready){location.replace("/auth/finish?t="+encodeURIComponent(r.ticket));return}if(q&&q.error){toast(t("google.fail"));return}}toast(t("google.timeout"))}
+function ask(title,body,ok){return new Promise(res=>{const m=$("#modal");m.innerHTML=`<div class=sheet role=dialog aria-modal=true><h3>${esc(title)}</h3><p>${esc(body)}</p><div class=sb><button type=button class=btn data-m=0>${esc(t("common.cancel"))}</button><button type=button class=pri data-m=1>${esc(ok)}</button></div></div>`;m.hidden=false;const done=v=>{m.hidden=true;m.innerHTML="";m.onclick=null;res(v)};m.onclick=e=>{const b=e.target.closest("[data-m]");if(b)done(b.dataset.m==="1");else if(e.target===m)done(false)};const p=m.querySelector(".pri");p&&p.focus()})}
 let si=0;const SL=[...document.querySelectorAll(".slide")];
-function slide(n){si=n;SL.forEach((s,i)=>s.classList.toggle("on",i===n));const dots=$("#dots");if(dots.childElementCount!==SL.length)dots.innerHTML=SL.map(()=>"<i></i>").join("");[...dots.children].forEach((d,i)=>d.classList.toggle("on",i===n));setText($("#nx"),n===SL.length-1?"Inizia":"Continua")}
-function endIntro(){try{localStorage.setItem("tc_intro","1")}catch(e){}hideAnimated($("#intro"),()=>route())}
+function slide(n){si=n;SL.forEach((s,i)=>s.classList.toggle("on",i===n));const dots=$("#dots");if(dots.childElementCount!==SL.length)dots.innerHTML=SL.map(()=>"<i></i>").join("");[...dots.children].forEach((d,i)=>d.classList.toggle("on",i===n));const nx=$("#nx");if(nx)nx.textContent=n===SL.length-1?t("intro.start"):t("intro.next")}
+function endIntro(){try{localStorage.setItem("tc_onboard","1")}catch(e){}api("/api/settings",{onboarded:true});hideAnimated($("#intro"),()=>enterApp())}
 $("#nx").onclick=()=>si<SL.length-1?slide(si+1):endIntro();$("#skip").onclick=endIntro;
-/* accesso */
 function fe(m,ok){const e=$("#fe");if(e){e.textContent=m||"";e.className="fe"+(ok?" ok":"")}}
-function showAuth(mode,after){
- const swap=mode!==AMODE&&!$("#auth").hidden&&$("#auth").innerHTML;
- AMODE=mode;$("#intro").hidden=true;
- const paint=()=>{
-  $("#app").hidden=true;$("#app").classList.remove("leaving");$("#app")._tok=($("#app")._tok||0)+1;
-  const A=$("#auth");A.hidden=false;A.classList.remove("leaving");
-  const T={login:["Bentornato.","Accedi per continuare."],register:["Crea il tuo account.","Bastano un'email e una password."],forgot:["Password dimenticata?","Inserisci la tua email. Ti invieremo un link che scade tra 15 minuti."],reset:["Nuova password.","Scegline una di almeno 10 caratteri."]}[mode];
-  const lr=mode==="login"||mode==="register";
-  A.innerHTML=`<div class=auth-wrap><div class="bento left">${side(FEATURES.left)}</div><div class=acard><div class=logo>T</div><h1>${T[0]}</h1><p class=sub>${T[1]}</p>
- ${lr?`<div class=seg><button type=button data-am=login class="${mode==="login"?"on":""}">Accedi</button><button type=button data-am=register class="${mode==="register"?"on":""}">Crea account</button></div>`:""}
- <form id=af novalidate>${mode!=="reset"?`<input type=email id=em placeholder="Email" autocomplete=email maxlength=254 required>`:""}${mode!=="forgot"?`<input type=password id=pw placeholder="Password" autocomplete="${mode==="login"?"current-password":"new-password"}" maxlength=128 required>`:""}
- <div id=fe class=fe role=alert></div><button class="pri wide" id=sb type=submit>${{login:"Accedi",register:"Crea account",forgot:"Invia link",reset:"Aggiorna password"}[mode]}</button></form>
- ${lr?`<div class=or><span>oppure</span></div><button type=button class="gbtn wide" id=gg ${GOOGLE?"":"disabled"}>${GSVG}Continua con Google</button>${GOOGLE?"":`<p class=hint>L'accesso con Google non è ancora configurato su questo computer.</p>`}`:""}
- <div class=links>${mode==="login"?`<a href="#" data-am=forgot>Password dimenticata?</a>`:""}${mode==="forgot"||mode==="reset"?`<a href="#" data-am=login>Torna all'accesso</a>`:""}<a href="#" id=reintro>Introduzione</a></div></div><div class="bento right">${side(FEATURES.right)}</div></div>`;
-  if(FLASH){fe(FLASH);FLASH=null}const f=$("#em")||$("#pw");f&&f.focus();after&&after()};
- if(!$("#app").hidden)hideAnimated($("#app"),paint);
- else if(swap)hideAnimated($("#auth"),()=>{paint()});
- else paint()}
-function route(){ME?enterApp():showAuth(RT?"reset":"login")}
-document.addEventListener("submit",async e=>{
- if(e.target.id!=="af")return;e.preventDefault();
- const em=$("#em")?$("#em").value.trim():"",pw=$("#pw")?$("#pw").value:"",b=$("#sb");b.disabled=true;fe("");let r;
+function showAuth(mode){AMODE=mode;$("#intro").hidden=true;const paint=()=>{$("#app").hidden=true;const A=$("#auth");A.hidden=false;const titles={login:["auth.login.title","auth.login.sub"],register:["auth.register.title","auth.register.sub"],forgot:["auth.forgot.title","auth.forgot.sub"],reset:["auth.reset.title","auth.reset.sub"]}[mode];const lr=mode==="login"||mode==="register";
+ A.innerHTML=`<div class=auth-wrap><div class="bento left"><article class="fcard lg"><h3>${esc(t("feat.see.t"))}</h3><p>${esc(t("feat.see.d"))}</p></article><article class="fcard sm"><h3>${esc(t("feat.hash.t"))}</h3><p>${esc(t("feat.hash.d"))}</p></article></div><div class=acard><img class=logo src="/logo.svg" alt=""><h1>${esc(t(titles[0]))}</h1><p class=sub>${esc(t(titles[1]))}</p>
+ ${lr?`<div class=seg><button type=button data-am=login class="${mode==="login"?"on":""}">${esc(t("auth.submit.login"))}</button><button type=button data-am=register class="${mode==="register"?"on":""}">${esc(t("auth.submit.register"))}</button></div>`:""}
+ <form id=af novalidate>${mode!=="reset"?`<input type=email id=em placeholder="${esc(t("auth.email"))}" autocomplete=email maxlength=254 required>`:""}${mode!=="forgot"?`<input type=password id=pw placeholder="${esc(t("auth.password"))}" autocomplete="${mode==="login"?"current-password":"new-password"}" maxlength=128 required>`:""}
+ <div id=fe class=fe role=alert></div><button class="pri wide" id=sb type=submit>${esc(t({login:"auth.submit.login",register:"auth.submit.register",forgot:"auth.submit.forgot",reset:"auth.submit.reset"}[mode]))}</button></form>
+ ${lr?`<div class=or><span>${esc(t("auth.or"))}</span></div><button type=button class="gbtn wide" id=gg ${GOOGLE?"":"disabled"}>${esc(t("auth.google"))}</button>${GOOGLE?"":`<p class=hint>${esc(t("auth.google.off"))}</p>`}`:""}
+ <div class=links>${mode==="login"?`<button type=button class=link data-am=forgot>${esc(t("auth.forgot.link"))}</button>`:""}${mode!=="login"?`<button type=button class=link data-am=login>${esc(t("auth.back"))}</button>`:""}<button type=button class=link id=guestbtn>${esc(t("auth.guest"))}</button></div></div><div class="bento right"><article class="fcard lg"><h3>${esc(t("feat.bin.t"))}</h3><p>${esc(t("feat.bin.d"))}</p></article><article class="fcard sm"><h3>${esc(t("feat.local.t"))}</h3><p>${esc(t("feat.local.d"))}</p></article></div></div>`;
+ if(FLASH){fe(FLASH);FLASH=null}const f=$("#em")||$("#pw");f&&f.focus()};
+ if(!$("#app").hidden)hideAnimated($("#app"),paint);else paint()}
+document.addEventListener("submit",async e=>{if(e.target.id!=="af")return;e.preventDefault();const em=$("#em")?$("#em").value.trim():"",pw=$("#pw")?$("#pw").value:"",b=$("#sb");b.disabled=true;fe("");let r;
  if(AMODE==="forgot")r=await api("/api/forgot",{email:em});else if(AMODE==="reset")r=await api("/api/reset",{token:RT,password:pw});else r=await api(AMODE==="login"?"/api/login":"/api/register",{email:em,password:pw});
  b.disabled=false;if(r.error)return fe(r.error);
- if(AMODE==="forgot")fe(MAIL?"Se esiste un account con questa email, il link è stato inviato. Scade tra 15 minuti.":"Questo programma non invia email, quindi la password non si può recuperare da qui. Per ripartire elimina la cartella dei dati dell'app (la guida dice dove si trova) e crea un nuovo account: i tuoi file non vengono toccati.",true);
- else if(AMODE==="reset"){RT="";showAuth("login",()=>fe("Password aggiornata. Ora puoi accedere.",true))}
+ if(AMODE==="forgot")fe(MAIL?t("auth.forgot.sent"):t("auth.forgot.nomail"),true);
+ else if(AMODE==="reset"){RT="";ME=null;enterApp();toast(t("auth.reset.ok"))}
  else{ME=r.user;CSRF=r.csrf;enterApp()}});
-/* app */
-function resetUI(){R=null;sel.clear();tab="home";filt="Tutti";q="";running=false;scanned=null;$("#scan").hidden=false;$("#scan").classList.remove("leaving");$("#res").hidden=true;$("#again").hidden=true;$("#prog").hidden=true;$("#act").hidden=true;setText($("#go"),"Avvia analisi")}
-function driveCard(x){const pct=x.total?Math.min(100,Math.round(x.used/x.total*100)):0;return `<label class=dcard><input type=checkbox checked value="${esc(x.path)}"><b>${esc(x.path)}</b><small>${fmt(x.used)} usati · ${fmt(x.free)} liberi su ${fmt(x.total)}</small><span class=pct>${pct}%</span><div class=bar><i style="width:${pct}%"></i></div></label>`}
-function crossReplace(el,html,done){const apply=()=>{if(!el)return;el.innerHTML=html;el.classList.remove("leaving");showIn(el);done&&done()};if(!el)return;if(REDUCE()){apply();return}el.classList.add("leaving");setTimeout(apply,180)}
-function updatePick(){const el=$("#pick");if(!el)return;const all=document.querySelectorAll("#drv input").length,n=document.querySelectorAll("#drv input:checked").length;el.textContent=all?(n+" di "+all+" "+(all===1?"disco selezionato":"dischi selezionati")):"Nessun disco rilevato su questo computer."}
-function paintStatus(){
- const el=$("#sys");if(!el)return;
- const plat={mac:"macOS",win:"Windows",linux:"Linux"}[PLAT]||PLAT;
- const rows=[["Piattaforma",plat],["Connessione","Solo questo computer (127.0.0.1)"],["Account",ME?(ME.name?ME.name+" · "+ME.email:ME.email):"—"],["Accesso Google",GOOGLE?"Configurato":"Non configurato"],["Email per la password",MAIL?"Server di posta configurato":"Non configurato"],["Analisi",running?"In corso":(R&&R.folders?"Risultati pronti":"In attesa")]];
- if(scanned!=null)rows.push(["File letti in questa sessione",scanned.toLocaleString("it")]);
- if(R&&R.folders){rows.push(["Cartelle non accessibili",(R.denied||0).toLocaleString("it")]);rows.push(["Lettura RAR e 7z",R.tool?"Disponibile":"Non disponibile"])}
- const html=rows.map(([k,v])=>`<div class=kv><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("");
- if(el.dataset.h!==html){el.dataset.h=html;el.innerHTML=html}}
-function hello(){const h=new Date().getHours(),p=h<5?"Buonanotte":h<12?"Buongiorno":h<18?"Buon pomeriggio":"Buonasera",g=$("#greet");if(g)g.textContent=ME&&ME.name?p+", "+ME.name:p}
-async function loadDrives(){
- const d=await api("/api/drives");if(!Array.isArray(d))return;
- const html=d.length?d.map(driveCard).join(""):`<p class=s>Nessun disco rilevato su questo computer.</p>`;
- const used=d.reduce((a,x)=>a+(x.used||0),0),total=d.reduce((a,x)=>a+(x.total||0),0),free=d.reduce((a,x)=>a+(x.free||0),0);
- const sum=`<div class=metric><small>Spazio usato</small><b>${fmt(used)}</b></div><div class=metric><small>Spazio libero</small><b>${fmt(free)}</b></div><div class=metric><small>Capacità</small><b>${fmt(total)}</b><small>${d.length} ${d.length===1?"disco":"dischi"}</small></div>`;
- crossReplace($("#drv"),html,updatePick);crossReplace($("#disksum"),sum)}
-async function enterApp(){
- const open=async()=>{
-  $("#auth").hidden=true;$("#auth").classList.remove("leaving");$("#intro").hidden=true;$("#app").hidden=false;showIn($("#app"));
-  $("#who").textContent=ME?(ME.name?ME.name+" · "+ME.email:ME.email):"";resetUI();hello();paintStatus();
-  const drives=loadDrives();
-  const s=await api("/api/status");
-  if(s.phase==="done"&&s.has_res){R=await api("/api/results");if(R&&R.folders){idx();render()}}
-  else if(["scan","agg","dups","arch"].includes(s.phase)){running=true;setText($("#go"),"Ferma");$("#prog").hidden=false;showIn($("#prog"));timer=setInterval(poll,600);poll()}
-  paintStatus();await drives};
- if(!$("#auth").hidden)hideAnimated($("#auth"),()=>{open()});else open()}
+function paintAcct(){const b=$("#acct");if(!b)return;b.textContent=ME?t("logout"):t("account");const w=$("#who");if(w)w.textContent=ME?(ME.name?ME.name+" · "+ME.email:ME.email):t("who.guest")}
+function resetUI(){R=null;sel.clear();tab=SHOT==="map"?"map":"home";filt="Tutti";q="";running=false;scanned=null;mapFocus="";mapStack=[];$("#scan").hidden=false;$("#res").hidden=true;$("#again").hidden=true;$("#prog").hidden=true;$("#act").hidden=true;const g=$("#go");if(g)g.textContent=t("go")}
+function driveCard(x){const pct=x.total?Math.min(100,Math.round(x.used/x.total*100)):0;return `<label class=dcard><input type=checkbox checked value="${esc(x.path)}"><b>${esc(x.path)}</b><small>${esc(tf("disk.meta",{used:fmt(x.used),free:fmt(x.free),total:fmt(x.total)}))}</small><span class=pct>${pct}%</span><div class=bar><i style="width:${pct}%"></i></div></label>`}
+function updatePick(){const el=$("#pick");if(!el)return;const all=document.querySelectorAll("#drv input").length,n=document.querySelectorAll("#drv input:checked").length;el.textContent=all?tf("disks.pick",{n:n,all:all}):t("disks.none")}
+function paintStatus(){const el=$("#sys");if(!el)return;const plat={mac:"macOS",win:"Windows",linux:"Linux"}[PLAT]||PLAT;const rows=[[t("status.platform"),plat],[t("status.conn"),t("status.local")],[t("status.account"),ME?(ME.name?ME.name+" · "+ME.email:ME.email):t("who.guest")],[t("status.google"),GOOGLE?t("status.yes"):t("status.no")],[t("status.analysis"),running?t("status.running"):(R&&R.folders?t("status.ready"):t("status.idle"))]];if(scanned!=null)rows.push([t("status.read"),scanned.toLocaleString(loc())]);if(R&&R.folders){rows.push([t("status.denied"),(R.denied||0).toLocaleString(loc())]);rows.push([t("status.rar"),R.tool?t("status.yes"):t("status.no")])}el.innerHTML=rows.map(([k,v])=>`<div class=kv><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("")}
+function hello(){const h=new Date().getHours(),p=h<5?t("greet.night"):h<12?t("greet.morning"):h<18?t("greet.afternoon"):t("greet.evening"),g=$("#greet");if(g)g.textContent=ME&&ME.name?p+", "+ME.name:p}
+async function loadDrives(){const d=await api("/api/drives");if(!Array.isArray(d))return;$("#drv").innerHTML=d.length?d.map(driveCard).join(""):`<p class=s>${esc(t("disks.none"))}</p>`;updatePick();const used=d.reduce((a,x)=>a+(x.used||0),0),total=d.reduce((a,x)=>a+(x.total||0),0),free=d.reduce((a,x)=>a+(x.free||0),0);$("#disksum").innerHTML=`<div class=metric><small>${esc(t("metric.used"))}</small><b>${fmt(used)}</b></div><div class=metric><small>${esc(t("metric.free"))}</small><b>${fmt(free)}</b></div><div class=metric><small>${esc(t("metric.cap"))}</small><b>${fmt(total)}</b><small>${d.length===1?t("metric.one"):tf("metric.many",{n:d.length})}</small></div>`}
+async function showSchedule(){const box=$("#sched");if(!box)return;if(!SCHED||!SCHED.enabled||!SCHED.due){box.hidden=true;return}const s=await api("/api/schedule");if(!s||s.error||!s.due){box.hidden=true;return}const items=s.preview||[];box.hidden=false;box.innerHTML=`<h3>${esc(t("schedule.card"))}</h3><p class=s>${esc(t("schedule.lead"))}</p>`+(items.length?`<p><b>${fmt(items.reduce((a,x)=>a+(x.size||0),0))}</b></p><div style="max-height:220px;overflow:auto">`+items.slice(0,40).map(x=>`<div class=hitem><b>${esc(x.name)}</b> · ${fmt(x.size)}<br><span class=s>${esc(whyOf(x))}</span></div>`).join("")+`</div><div class=r style="margin-top:12px"><button class=pri id=schedgo>${esc(t("schedule.now"))}</button><button class=btn id=schedlater>${esc(t("schedule.later"))}</button></div>`:`<p class=s>${esc(t("schedule.empty"))}</p><button class=btn id=schedlater>${esc(t("schedule.later"))}</button>`);const go=$("#schedgo");if(go)go.onclick=async()=>{if(!await ask(t("trash.ask.title"),t("schedule.confirm"),t("trash.ask.ok")))return;const r=await api("/api/schedule_apply",{paths:items.map(x=>x.path)});if(r.error){toast(r.error);return}SCHED.due=false;box.hidden=true;if(r.undo)toastUndo(tf("trash.result",{n:r.done.length,size:fmt(r.freed)}),r.undo);else toast(t("schedule.empty"));if(R){R=await api("/api/results");if(R&&R.folders){idx();render()}}};const later=$("#schedlater");if(later)later.onclick=async()=>{await api("/api/settings",{schedule_dismiss:true});SCHED.due=false;box.hidden=true}}
+async function checkUpdates(){if(!UPDATES){$("#upd").hidden=true;return}const r=await api("/api/update_check",{});if(!r||!r.update||!r.url)return;let hide="";try{hide=localStorage.getItem("tc_upd_hide")||""}catch(e){}if(hide&&hide===r.latest)return;const el=$("#upd");el.hidden=false;el.innerHTML=`<span>${esc(tf("update.banner",{v:r.latest}))}</span><span><a href="${esc(r.url)}">${esc(t("update.open"))}</a> · <button type=button class=btn id=updno>${esc(t("update.later"))}</button></span>`;$("#updno").onclick=()=>{try{localStorage.setItem("tc_upd_hide",r.latest)}catch(e){}el.hidden=true}}
+async function enterApp(){const open=async()=>{$("#auth").hidden=true;$("#intro").hidden=true;$("#app").hidden=false;applyLang();paintAcct();resetUI();hello();paintStatus();const drives=loadDrives();const s=await api("/api/status");if(s.phase==="done"&&s.has_res&&SHOT!=="app"){R=await api("/api/results");if(R&&R.folders){idx();if(SHOT==="map")tab="map";render()}}else if(["scan","agg","dups","arch"].includes(s.phase)){running=true;$("#go").textContent=t("stop");$("#prog").hidden=false;timer=setInterval(poll,600);poll()}paintStatus();await drives;showSchedule();checkUpdates()};if(!$("#auth").hidden)hideAnimated($("#auth"),()=>{open()});else open()}
 function stopPoll(){clearInterval(timer);running=false}
-function list(){
- let L=tab==="folders"?R.folders:tab==="games"?R.folders.filter(x=>x.cat==="Gioco"):tab==="files"?R.files:R.archives;
- if(tab==="folders"||tab==="files")L=L.filter(x=>filt==="Tutti"||x.cat===filt);
- if(q)L=L.filter(x=>x.path.toLowerCase().includes(q));
- return [...L].sort((a,b)=>sortk==="name"?a.name.localeCompare(b.name):sortk==="date"?(a.mtime||0)-(b.mtime||0):b.size-a.size)}
-function row(x,mx){
- const isA=tab==="arch",ck=tab==="files"||isA,pl=isA?pill(...LV[x.level]):pill(x.cat,PC[x.cat]);
- const why=isA?x.why+(x.vols.length>1?` · ${x.vols.length} parti`:""):x.why+(x.files!=null?" · "+x.files.toLocaleString("it")+" file":"");
- return `<div class="row ${ck?"":"nc"}">${ck?`<input type=checkbox data-s="${esc(x.path)}" ${sel.has(x.path)?"checked":""}>`:""}${pl}<div class=nm><b>${esc(x.name)}</b><small>${esc(x.path)}</small><small>${esc(why)}${x.mtime?" · modificato il "+dt(x.mtime):""}</small></div><div>${fmt(x.size)}<div class=bar><i style="width:${Math.max(2,x.size/mx*100)}%"></i></div></div><button class=btn data-p="${esc(x.path)}">${OSN[PLAT].show}</button></div>`}
-function home(){
- const tot=R.totals||{},rec=(tot["Scarto"]||0)+(R.wasted||0)+(R.arch_total||0),O=OSN[PLAT];
- const folders=R.folders||[],files=R.files||[],dups=R.dups||[],arch=R.archives||[],games=folders.filter(x=>x.cat==="Gioco"),disks=R.disks||[];
- const used=disks.reduce((a,d)=>a+(d.used||0),0),total=disks.reduce((a,d)=>a+(d.total||0),0),free=disks.reduce((a,d)=>a+(d.free||0),0);
- const catSum=CATS.reduce((a,c)=>a+(tot[c]||0),0);
- let h=`<div class=hero><small>Spazio recuperabile stimato</small><big>${fmt(rec)}</big><p>Somma delle cartelle di scarto, delle copie doppie e degli archivi già estratti. Nulla viene eliminato senza la tua conferma e tutto va nel Cestino.</p></div>`;
- if(R.denied)h+=`<div class=warn><b>${R.denied.toLocaleString("it")}</b> cartelle non erano accessibili e sono state saltate. ${O.perm}</div>`;
- if(!R.tool)h+=`<div class=warn>${O.tool}</div>`;
- const stats=[["Cartelle elencate",folders.length.toLocaleString("it"),"folders"],["File grandi",files.length.toLocaleString("it"),"files"],["Giochi",games.length.toLocaleString("it"),"games"],["Gruppi di doppioni",dups.length.toLocaleString("it"),"dups"],["Archivi già estratti",arch.length.toLocaleString("it"),"arch"],["Copie in più",fmt(R.wasted||0),"dups"],["Scarto",fmt(tot["Scarto"]||0),"folders|Scarto"],["Spazio libero sui dischi",fmt(free),""]];
- h+=`<div class=statgrid>`+stats.map(([l,n,go])=>go?`<button type=button class=k data-go="${go}"><small>${esc(l)}</small><b>${n}</b></button>`:`<div class=k><small>${esc(l)}</small><b>${n}</b></div>`).join("")+`</div>`;
- h+=`<div class=split><div class=card><h2>Per categoria</h2><p class=s>Peso delle cartelle elencate, non dell'intero disco.</p>`+CATS.map(c=>{const v=tot[c]||0,p=catSum?v/catSum*100:0;return `<div class=catrow>${pill(c,PC[c])}<b>${fmt(v)}</b><div class=bar><i style="width:${p.toFixed(1)}%"></i></div></div>`}).join("")+`</div>`;
- h+=`<div class=card><h2>Azioni rapide</h2><p class=s>Apri una sezione dei risultati di questa analisi.</p><div class=qacts>
- <button type=button class=qbtn data-go="folders|Scarto">Rivedi scarti<small>${fmt(tot["Scarto"]||0)}</small></button>
- <button type=button class=qbtn data-go="dups">Rivedi doppioni<small>${fmt(R.wasted||0)}</small></button>
- <button type=button class=qbtn data-go="arch">Rivedi archivi<small>${fmt(R.arch_total||0)}</small></button>
- <button type=button class=qbtn data-go="games">Vedi giochi<small>${fmt(tot["Gioco"]||0)}</small></button>
- <button type=button class=qbtn data-go="files">File grandi<small>${files.length.toLocaleString("it")}</small></button>
- </div></div></div>`;
- if(folders.length){const top=folders.slice(0,4),mx=top[0].size||1;h+=`<div class=card><h2>Cartelle più pesanti</h2><p class=s>Le più grandi trovate in questa analisi.</p>`+top.map(x=>`<div class="row nc">${pill(x.cat,PC[x.cat])}<div class=nm><b>${esc(x.name)}</b><small>${esc(x.path)}</small></div><div>${fmt(x.size)}<div class=bar><i style="width:${Math.max(2,x.size/mx*100)}%"></i></div></div><button type=button class=btn data-p="${esc(x.path)}">${O.show}</button></div>`).join("")+`<div class=r style="margin-top:12px"><button type=button class=btn data-go="folders">Tutte le cartelle</button></div></div>`}
- h+=`<div class=card><h2>Dischi</h2><p class=s>${fmt(used)} usati · ${fmt(free)} liberi · ${fmt(total)} di capacità, sui dischi letti.</p>`+(disks.length?disks.map(d=>`<p class=s style="margin:14px 0 0">${esc(d.path)} · ${fmt(d.used)} usati di ${fmt(d.total)} · liberi ${fmt(d.free)}</p><div class=bar><i style="width:${d.total?d.used/d.total*100:0}%"></i></div>`).join(""):`<p class=s>Nessun disco nel risultato.</p>`)+`</div>`;
- h+=`<div class=card><h2>Come leggere le etichette</h2><div class="leg" style="margin-top:14px">`+CATS.map(c=>`<div>${pill(c,PC[c])} ${esc(LEG[c])}</div>`).join("")+`</div></div>`;
- if(scanned!=null)h+=`<p class=s>File letti in questa sessione: ${scanned.toLocaleString("it")}.</p>`;
- return h}
-function render(){
- if(!R||!R.folders)return;
- const n={folders:R.folders.length,games:R.folders.filter(x=>x.cat==="Gioco").length,files:R.files.length,dups:R.dups.length,arch:R.archives.length};
- const navHtml=NAV.map(([k,t])=>`<button type=button class="nv ${k===tab?"on":""}" data-t="${k}">${t}${n[k]!=null?`<em>${n[k]}</em>`:""}</button>`).join("");
- const nav=$("#nav");if(nav.dataset.h!==navHtml){nav.dataset.h=navHtml;nav.innerHTML=navHtml}
- let h="";
- if(tab==="home")h=home();
- else{
-  h=`<div class=card><h2>${NAV.find(x=>x[0]===tab)[1]}</h2><p class=s>${INTRO[tab]}</p>`;
-  if(tab==="arch"&&!R.archives.length)h+=`<p class=s>Nessun archivio già estratto trovato.</p>`;
-  h+=`<div class=r><input type=text id=q placeholder="Cerca per nome o percorso…" value="${esc(q)}" style="flex:1;min-width:200px"><select id=so><option value=size ${sortk==="size"?"selected":""}>Più grandi prima</option><option value=name ${sortk==="name"?"selected":""}>Nome</option><option value=date ${sortk==="date"?"selected":""}>Più vecchi prima</option></select><button class=btn id=csv>Esporta CSV</button>`;
-  if(tab==="arch")h+=`<button class=btn id=selok>Seleziona i già estratti</button>`;
-  if(tab==="dups")h+=`<button class=btn id=keep>Tieni solo la copia più vecchia</button>`;
-  h+=`</div>`;
-  if(tab==="folders"||tab==="files")h+=`<div class=r>`+["Tutti",...CATS].map(c=>`<button class="chip ${c===filt?"on":""}" data-f="${esc(c)}">${esc(c)}</button>`).join("")+`</div>`;
-  if(tab==="dups"){
-   const G=R.dups.filter(g=>!q||g.paths.some(p=>p.toLowerCase().includes(q)));
-   h+=`<p class=s style="margin-top:16px">Recuperabile eliminando le copie: <b>${fmt(R.wasted)}</b></p>`+(G.length?G.map(g=>`<div class=grp><b>${g.paths.length} copie × ${fmt(g.size)}</b> · spreco ${fmt(g.wasted)}${g.paths.map(p=>`<div class=cp><input type=checkbox data-s="${esc(p)}" ${sel.has(p)?"checked":""}><span>${esc(p)}</span><button class=btn data-p="${esc(p)}">${OSN[PLAT].show}</button></div>`).join("")}</div>`).join(""):"<p class=s>Nessun doppione trovato (o ricerca disattivata).</p>");
-  }else{const L=list(),mx=Math.max(1,...L.map(x=>x.size));h+=`<div style="margin-top:14px">`+(L.length?L.map(x=>row(x,mx)).join(""):"<p class=s>Niente da mostrare con questi filtri.</p>")+`</div>`}
-  h+=`</div>`}
- const typing=document.activeElement&&document.activeElement.id==="q";
- const paint=()=>{
-  $("#again").hidden=false;$("#res").hidden=false;$("#view").innerHTML=h;
-  if(typing){const e=$("#q");if(e){e.focus();e.setSelectionRange(e.value.length,e.value.length)}}
-  else showIn($("#view"));
-  act();paintStatus()};
- if($("#res").hidden){
-  if($("#scan").classList.contains("leaving")){$("#view")._pending=h;return}
-  hideAnimated($("#scan"),()=>{$("#prog").hidden=true;if($("#view")._pending){h=$("#view")._pending;$("#view")._pending="";paint()}});
-  try{window.scrollTo(0,0)}catch(e){}
-  paint();
- }else paint()}
-function act(){
- const a=$("#act");if(!sel.size){if(!a.hidden)hideAnimated(a);return}
- let s=0;sel.forEach(p=>s+=AM[p]?AM[p].size:(SZ[p]||0));
- const was=a.hidden;a._tok=(a._tok||0)+1;a.hidden=false;a.classList.remove("leaving");
- a.innerHTML=`<span><b>${sel.size}</b> selezionati · <b>${fmt(s)}</b></span><button type=button class=btn id=clr>Deseleziona</button><button type=button class=dng id=del>Sposta nel Cestino</button>`;
- if(was)showIn(a)}
-async function trash(){
- const paths=[];sel.forEach(p=>{if(AM[p])AM[p].vols.forEach(v=>paths.push(v[0]));else paths.push(p)});
- if(!await ask("Spostare nel Cestino?",`${paths.length} file verranno spostati nel Cestino.\nPotrai recuperarli da lì. Di ogni gruppo di doppioni resta sempre almeno una copia.`,"Sposta nel Cestino"))return;
- toast("Sposto nel Cestino… può richiedere qualche istante.",60000);
- const r=await api("/api/trash",{paths});
- if(r.error){toast("Errore: "+r.error);return}
- sel.clear();R=await api("/api/results");idx();render();
- toast(`Spostati ${r.done.length} file · liberati ${fmt(r.freed)}`+(r.failed.length?` · ${r.failed.length} non spostati: ${r.failed[0][1]}`:""),9000)}
-function idx(){AM={};SZ={};R.files.forEach(f=>SZ[f.path]=f.size);R.archives.forEach(a=>AM[a.path]=a);R.dups.forEach(g=>g.paths.forEach(p=>SZ[p]=g.size))}
-const cell=v=>{let s=String(v);if(/^[=+\-@\t\r]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"'};
-document.addEventListener("click",async e=>{
- const g=id=>e.target.closest(id),p=g("[data-p]"),f=g("[data-f]"),t=g("[data-t]"),o=g("[data-go]"),am=g("[data-am]");
- if(am){e.preventDefault();return showAuth(am.dataset.am)}
- if(g("#reintro")){e.preventDefault();hideAnimated($("#auth"),()=>{$("#intro").hidden=false;slide(0)})}
- if(g("#gg")&&GOOGLE){googleGo()}
- if(p)api("/api/reveal",{path:p.dataset.p});
- if(f){filt=f.dataset.f;render()}
- if(t){tab=t.dataset.t;q="";render()}
- if(o){const[a,b]=o.dataset.go.split("|");tab=a;filt=b||"Tutti";q="";render()}
- if(g("#clr")){sel.clear();render()}
- if(g("#act #del"))trash();
- if(g("#selok")){R.archives.filter(a=>a.level==="ok").forEach(a=>sel.add(a.path));render()}
- if(g("#keep")){R.dups.forEach(d=>{const k=d.mt.indexOf(Math.min(...d.mt));d.paths.forEach((x,i)=>i!==k&&sel.add(x))});render()}
- if(g("#csv")){
-  const rows=tab==="dups"?R.dups.flatMap(d=>d.paths.map(x=>[d.size,d.paths.length,x])):list().map(x=>[x.cat||x.level,x.size,x.path,x.why]);
-  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["\ufeff"+rows.map(r=>r.map(cell).join(";")).join("\n")],{type:"text/csv"}));a.download="twenties_cleaning.csv";a.click()}});
-document.addEventListener("change",e=>{
- if(e.target.dataset.s){e.target.checked?sel.add(e.target.dataset.s):sel.delete(e.target.dataset.s);act()}
- if(e.target.id==="so"){sortk=e.target.value;render()}
- if(e.target.closest&&e.target.closest("#drv"))updatePick()});
+function list(){let L=tab==="folders"?R.folders:tab==="files"?R.files:R.archives;if(tab==="folders"||tab==="files")L=L.filter(x=>filt==="Tutti"||x.cat===filt);if(q)L=L.filter(x=>(x.path||"").toLowerCase().includes(q));return [...L].sort((a,b)=>sortk==="name"?a.name.localeCompare(b.name):sortk==="date"?(a.mtime||0)-(b.mtime||0):b.size-a.size)}
+function row(x,mx){const isA=tab==="arch",ck=tab==="files"||isA,pl=isA?`<span class="pill ${x.level==="ok"?"p-s":"p-m"}">${esc(t("level."+x.level))}</span>`:pill(x.cat);const why=whyOf(x)+(x.files!=null&&!isA?" · "+tf("files.count",{n:x.files.toLocaleString(loc())}):"");return `<div class="row ${ck?"":"nc"}">${ck?`<input type=checkbox data-s="${esc(x.path)}" ${sel.has(x.path)?"checked":""}>`:""}${pl}<div class=nm><b>${esc(x.name)}</b><small>${esc(x.path)}</small><small>${esc(why)}${x.mtime?" · "+esc(tf("modified",{d:dt(x.mtime)})):""}</small></div><div>${fmt(x.size)}<div class=bar><i style="width:${Math.max(2,x.size/mx*100)}%"></i></div></div><button class=btn data-p="${esc(x.path)}">${esc(os("show"))}</button></div>`}
+function home(){const tot=R.totals||{},scarto=R.scarto_total||tot["Scarto"]||0,O=os;const folders=R.folders||[],files=R.files||[],dups=R.dups||[],arch=R.archives||[],games=R.games||folders.filter(x=>x.cat==="Gioco"),disks=R.disks||[];const free=disks.reduce((a,d)=>a+(d.free||0),0),used=disks.reduce((a,d)=>a+(d.used||0),0),total=disks.reduce((a,d)=>a+(d.total||0),0);const catSum=CATS.reduce((a,c)=>a+(tot[c]||0),0);let h=`<div class=hero><small>${esc(t("home.scarto.kicker"))}</small><big>${fmt(scarto)}</big><p>${esc(t("home.scarto.note"))}</p></div>`;if(R.denied)h+=`<div class=warn>${esc(tf("home.denied",{n:R.denied.toLocaleString(loc())}))} ${esc(os("perm"))}</div>`;if(!R.tool)h+=`<div class=warn>${t("tool."+(PLAT==="mac"||PLAT==="win"?PLAT:"linux"))}</div>`;const stats=[[t("home.stats.folders"),folders.length, "folders"],[t("home.stats.files"),files.length,"files"],[t("home.stats.games"),games.length,"games"],[t("home.stats.dups"),dups.length,"dups"],[t("home.stats.arch"),arch.length,"arch"],[t("home.stats.copies"),fmt(R.wasted||0),"dups"],[t("home.stats.scarto"),fmt(scarto),"folders"],[t("home.stats.free"),fmt(free),""]];h+=`<div class=statgrid>`+stats.map(([l,n,go])=>go?`<button type=button class=k data-go="${go}"><small>${esc(l)}</small><b>${typeof n==="number"?n.toLocaleString(loc()):n}</b></button>`:`<div class=k><small>${esc(l)}</small><b>${n}</b></div>`).join("")+`</div>`;h+=`<div class=card><h2>${esc(t("home.bycat"))}</h2><p class=s>${esc(t("home.bycat.note"))}</p>`+CATS.map(c=>{const v=tot[c]||0,p=catSum?v/catSum*100:0;return `<div class=r style="justify-content:space-between">${pill(c)}<b>${fmt(v)}</b><div class=bar style="flex:1"><i style="width:${p.toFixed(1)}%"></i></div></div>`}).join("")+`</div>`;h+=`<div class=card><h2>${esc(t("home.quick"))}</h2><div class=r>`+[["folders",t("home.q.scarto")],[ "dups",t("home.q.dups")],[ "arch",t("home.q.arch")],[ "games",t("home.q.games")],[ "map",t("nav.map")]].map(([k,l])=>`<button class=btn data-go="${k}">${esc(l)}</button>`).join("")+`</div></div>`;if(folders[0]){const top=folders.slice(0,4),mx=top[0].size||1;h+=`<div class=card><h2>${esc(t("home.top"))}</h2>`+top.map(x=>`<div class="row nc">${pill(x.cat)}<div class=nm><b>${esc(x.name)}</b><small>${esc(x.path)}</small><small>${esc(whyOf(x))}</small></div><div>${fmt(x.size)}<div class=bar><i style="width:${Math.max(2,x.size/mx*100)}%"></i></div></div><button class=btn data-p="${esc(x.path)}">${esc(os("show"))}</button></div>`).join("")+`</div>`}h+=`<div class=card><h2>${esc(t("home.legend"))}</h2><div class=leg>`+CATS.map(c=>`<div>${pill(c)} ${esc(t("leg."+CK[c].split(".")[1]))}</div>`).join("")+`</div></div>`;h+=`<p class=s>${esc(tf("home.disks.note",{used:fmt(used),free:fmt(free),total:fmt(total)}))}</p>`;return h}
+function gamesHtml(){const games=(R.games&&R.games.length?R.games:R.folders.filter(x=>x.cat==="Gioco"));let L=games;if(q)L=L.filter(x=>(x.path||"").toLowerCase().includes(q));L=[...L].sort((a,b)=>b.size-a.size);let h=`<div class=card><h2>${esc(t("nav.games"))}</h2><p class=s>${esc(t("games.lead"))}</p><p class=s>${esc(t("games.access.note"))}</p><div class=r><input id=q placeholder="${esc(t("search"))}" value="${esc(q)}" style="flex:1"></div>`;if(!L.length)h+=`<p class=s>${esc(t("games.empty"))}</p>`;else h+=`<div class=glib>`+L.map(g=>{const launch=g.launcher?`<a href="${esc(g.launcher_url)}">${esc(tf("games.open",{name:g.launcher}))}</a>`:`<span>${esc(t("games.unknown"))}</span>`;return `<article class=gcard><b>${esc(g.name)}</b><p>${fmt(g.size)} · ${esc(whyOf(g))}</p><p>${esc(t("games.launcher"))}: ${launch}</p><p>${esc(t("games.access"))}: ${g.atime?dt(g.atime):t("games.unknown.date")}</p><p>${esc(t("games.modified"))}: ${dt(g.mtime)||"—"}</p><button class=btn data-p="${esc(g.path)}">${esc(os("show"))}</button></article>`}).join("")+`</div>`;return h+`</div>`}
+function findNode(path,nodes){for(const n of nodes||[]){if(n.path===path)return n;const c=findNode(path,n.children);if(c)return c}return null}
+function currentMap(){const roots=(R&&R.map)||[];if(mapFocus){const n=findNode(mapFocus,roots);if(n)return n}if(roots.length===1)return roots[0];const size=roots.reduce((s,n)=>s+(n.size||0),0);return {name:t("map.root"),path:"",size:size,cat:"",why:t("map.lead"),children:roots,virtual:true}}
+function col(cat){const dark=document.documentElement.dataset.th==="dark";const m={"Gioco":"#0F6E6B","Scarto":"#C2410C","Importanza bassa":dark?"#8C7E68":"#C4B49A","Importanza media":dark?"#1F8F8B":"#0F6E6B","Importanza elevata":dark?"#E4DCCE":"#2C2A26"};return m[cat]||(dark?"#8A8478":"#8A8478")}
+function arc(cx,cy,r0,r1,a0,a1){let span=a1-a0;if(span>=Math.PI*2-1e-3){a1=a0+Math.PI*2-0.0001;span=a1-a0}const large=span>Math.PI?1:0;const P=(r,a)=>[cx+Math.cos(a)*r,cy+Math.sin(a)*r];const A=P(r1,a0),B=P(r1,a1),C=P(r0,a1),D=P(r0,a0);const f=n=>n.toFixed(2);return `M${f(A[0])} ${f(A[1])} A${r1} ${r1} 0 ${large} 1 ${f(B[0])} ${f(B[1])} L${f(C[0])} ${f(C[1])} A${r0} ${r0} 0 ${large} 0 ${f(D[0])} ${f(D[1])} Z`}
+function drawMap(){const host=$("#mapdraw");if(!host)return;const node=currentMap();const kids=(node.children||[]).filter(c=>c.size>0);const info=()=>paintMapInfo(node);if(!kids.length){host.innerHTML=`<p class=s>${esc(t("map.empty"))}</p>`;info();return}if(mapMode==="tree"){const W=640,H=420,rects=[];function split(nodes,x,y,w,h){if(!nodes.length||w<2||h<2)return;if(nodes.length===1){rects.push({n:nodes[0],x:x,y:y,w:w,h:h});return}const tot=nodes.reduce((s,n)=>s+n.size,0)||1;let acc=0,i=0;while(i<nodes.length-1&&acc+nodes[i].size<=tot*0.5){acc+=nodes[i].size;i++}if(i<1)i=1;acc=nodes.slice(0,i).reduce((s,n)=>s+n.size,0);const f=acc/tot;if(w>=h){split(nodes.slice(0,i),x,y,Math.max(1,w*f),h);split(nodes.slice(i),x+w*f,y,Math.max(1,w*(1-f)),h)}else{split(nodes.slice(0,i),x,y,w,Math.max(1,h*f));split(nodes.slice(i),x,y+h*f,w,Math.max(1,h*(1-f)))}}split(kids,6,6,W-12,H-12);let svg=`<svg viewBox="0 0 ${W} ${H}" role="img">`;rects.forEach(r=>{svg+=`<rect class=seg data-id="${esc(r.n.path)}" x="${r.x.toFixed(1)}" y="${r.y.toFixed(1)}" width="${Math.max(1,r.w-3).toFixed(1)}" height="${Math.max(1,r.h-3).toFixed(1)}" rx="8" fill="${col(r.n.cat)}"></rect>`});host.innerHTML=svg+`</svg>`;const back=$("#mback");if(back)back.disabled=!mapStack.length;info();return}const W=640,H=460,cx=320,cy=230;let svg=`<svg viewBox="0 0 ${W} ${H}" role="img"><circle class=mhub cx="${cx}" cy="${cy}" r="62"/>`;const tot=kids.reduce((s,c)=>s+c.size,0)||1;let a=-Math.PI/2;kids.forEach(c=>{const span=Math.PI*2*(c.size/tot);const a1=a+span;svg+=`<path class=seg data-id="${esc(c.path)}" d="${arc(cx,cy,74,168,a,a1)}" fill="${col(c.cat)}"></path>`;const gk=(c.children||[]).filter(x=>x.size>0).slice(0,10);const gt=gk.reduce((s,x)=>s+x.size,0)||1;let b=a;gk.forEach(g=>{const gs=span*(g.size/gt);svg+=`<path class=seg data-id="${esc(g.path)}" d="${arc(cx,cy,174,214,b,b+gs)}" fill="${col(g.cat)}"></path>`;b+=gs});a=a1});host.innerHTML=svg+`</svg>`;const back=$("#mback");if(back)back.disabled=!mapStack.length;info()}
+function paintMapInfo(node){const el=$("#mapinfo");if(!el)return;const rootish=!node.path||node.virtual||((R.map||[]).some(r=>r.path===node.path)&&mapStack.length===0&&!mapFocus);const cat=node.cat?pill(node.cat):"";el.innerHTML=`<h3>${esc(node.name||t("map.root"))}</h3><p class=s>${fmt(node.size||0)}</p>${cat}<p>${esc(whyOf(node)||t("map.lead"))}</p>`+(node.path&&!rootish?`<div class=r><button class=btn id=mapopen>${esc(t("map.open"))}</button><button class=btn id=maptrash>${esc(t("map.trash"))}</button></div>`:`<p class=s>${esc(t("map.pick"))}</p>`);const o=$("#mapopen"),tr=$("#maptrash");if(o)o.onclick=()=>api("/api/reveal",{path:node.path});if(tr)tr.onclick=()=>trashPaths([node.path],tf("map.confirm",{name:node.name,why:whyOf(node)||""}))}
+function mapHtml(){const node=currentMap();const crumbs=[...mapStack];let h=`<div class=card><h2>${esc(t("nav.map"))}</h2><p class=s>${esc(t("map.lead"))}</p><div class=r><button class="chip ${mapMode==="sun"?"on":""}" id=msun>${esc(t("map.sun"))}</button><button class="chip ${mapMode==="tree"?"on":""}" id=mtree>${esc(t("map.tree"))}</button><button class=btn id=mback ${mapStack.length?"":"disabled"}>${esc(t("map.back"))}</button></div><div class=maplay><div id=mapdraw></div><aside id=mapinfo></aside></div></div>`;return h}
+function render(){if(!R||!R.folders)return;const n={folders:R.folders.length,games:(R.games||R.folders.filter(x=>x.cat==="Gioco")).length,files:R.files.length,dups:R.dups.length,arch:R.archives.length,map:(R.map||[]).length?1:0};const nav=$("#nav");nav.innerHTML=NAV.map(([k,key])=>`<button type=button class="nv ${k===tab?"on":""}" data-t="${k}">${esc(t(key))}${n[k]!=null&&k!=="home"&&k!=="map"?`<em>${n[k]}</em>`:""}</button>`).join("");let h="";if(tab==="home")h=home();else if(tab==="map")h=mapHtml();else if(tab==="games")h=gamesHtml();else{const title=t(NAV.find(x=>x[0]===tab)[1]);h=`<div class=card><h2>${esc(title)}</h2><p class=s>${esc(t("intro."+tab))}</p><div class=r><input id=q placeholder="${esc(t("search"))}" value="${esc(q)}" style="flex:1;min-width:180px"><select id=so><option value=size ${sortk==="size"?"selected":""}>${esc(t("sort.size"))}</option><option value=name ${sortk==="name"?"selected":""}>${esc(t("sort.name"))}</option><option value=date ${sortk==="date"?"selected":""}>${esc(t("sort.date"))}</option></select>`;if(tab==="arch")h+=`<button class=btn id=selok>${esc(t("selok"))}</button>`;if(tab==="dups")h+=`<button class=btn id=keep>${esc(t("keep"))}</button>`;h+=`</div>`;if(tab==="folders"||tab==="files")h+=`<div class=r><button class="chip ${filt==="Tutti"?"on":""}" data-f="Tutti">${esc(t("cat.tutti"))}</button>`+CATS.map(c=>`<button class="chip ${c===filt?"on":""}" data-f="${esc(c)}">${esc(t(CK[c]))}</button>`).join("")+`</div>`;if(tab==="dups"){const G=R.dups.filter(g=>!q||g.paths.some(p=>p.toLowerCase().includes(q)));h+=`<p class=s>${esc(t("dups.hash"))} ${esc(tf("dups.lead",{size:fmt(R.wasted||0)}))}</p>`+(G.length?G.map(g=>`<div class=grp><b>${g.paths.length} × ${fmt(g.size)}</b> · ${fmt(g.wasted)}${g.paths.map(p=>`<div class=cp><input type=checkbox data-s="${esc(p)}" ${sel.has(p)?"checked":""}><span>${esc(p)}</span><button class=btn data-p="${esc(p)}">${esc(os("show"))}</button></div>`).join("")}</div>`).join(""):`<p class=s>${esc(t("empty.dups"))}</p>`)}else{const L=list(),mx=Math.max(1,...L.map(x=>x.size));h+=`<div style="margin-top:12px">`+(L.length?L.map(x=>row(x,mx)).join(""):`<p class=s>${esc(t("empty.filters"))}</p>`)+`</div>`}h+=`</div>`}$("#again").hidden=false;$("#res").hidden=false;$("#scan").hidden=true;$("#view").innerHTML=h;if(tab==="map")drawMap();act();paintStatus()}
+function act(){const a=$("#act");if(!sel.size){a.hidden=true;return}let s=0;sel.forEach(p=>s+=AM[p]?AM[p].size:(SZ[p]||0));a.hidden=false;a.innerHTML=`<span><b>${sel.size}</b> · <b>${fmt(s)}</b></span><button type=button class=btn id=clr>${esc(t("act.clear"))}</button><button type=button class=dng id=del2>${esc(t("act.trash"))}</button>`}
+async function trashPaths(paths,body){if(!paths.length)return;if(!await ask(t("trash.ask.title"),body||tf("trash.ask.body",{n:paths.length}),t("trash.ask.ok")))return;toast(t("trash.working"),60000);const r=await api("/api/trash",{paths});if(r.error){toast(r.error);return}sel.clear();R=await api("/api/results");if(R&&R.folders){idx();render()}if(r.undo)toastUndo(tf("trash.result",{n:(r.done||[]).length,size:fmt(r.freed||0)}),r.undo);else toast(tf("trash.result",{n:(r.done||[]).length,size:fmt(r.freed||0)}))}
+async function trash(){const paths=[];sel.forEach(p=>{if(AM[p])AM[p].vols.forEach(v=>paths.push(v[0]));else paths.push(p)});trashPaths(paths)}
+async function doUndo(id){const r=await api("/api/undo",{id});$("#toast").hidden=true;if(r&&r.ok)toast(tf("undo.ok",{n:(r.restored||[]).length}));else toast(t("settings.undo.manual"))}
+function idx(){AM={};SZ={};(R.files||[]).forEach(f=>SZ[f.path]=f.size);(R.archives||[]).forEach(a=>AM[a.path]=a);(R.dups||[]).forEach(g=>g.paths.forEach(p=>SZ[p]=g.size))}
+document.addEventListener("click",async e=>{const g=id=>e.target.closest(id);const am=g("[data-am]");if(am){e.preventDefault();return showAuth(am.dataset.am)}if(g("#guestbtn"))return enterApp();if(g("#gg")&&GOOGLE)googleGo();const p=g("[data-p]");if(p)api("/api/reveal",{path:p.dataset.p});const f=g("[data-f]");if(f){filt=f.dataset.f;render()}const tb=g("[data-t]");if(tb){tab=tb.dataset.t;q="";render()}const o=g("[data-go]");if(o){tab=o.dataset.go;filt="Tutti";q="";render()}if(g("#clr")){sel.clear();render()}if(g("#del2"))trash();if(g("#selok")){(R.archives||[]).filter(a=>a.level==="ok").forEach(a=>sel.add(a.path));render()}if(g("#keep")){(R.dups||[]).forEach(d=>{const k=d.mt.indexOf(Math.min(...d.mt));d.paths.forEach((x,i)=>{if(i!==k)sel.add(x)})});render()}if(g("#msun")){mapMode="sun";drawMap();document.querySelectorAll("#view .chip").forEach((c,i)=>c.classList.toggle("on",i===0))}if(g("#mtree")){mapMode="tree";drawMap()}if(g("#mback")){mapFocus=mapStack.pop()||"";drawMap();const back=$("#mback");if(back)back.disabled=!mapStack.length}const seg=g(".seg");if(seg&&seg.dataset.id){mapStack.push(mapFocus);mapFocus=seg.dataset.id;drawMap()}});
+document.addEventListener("change",e=>{if(e.target.dataset&&e.target.dataset.s){e.target.checked?sel.add(e.target.dataset.s):sel.delete(e.target.dataset.s);act()}if(e.target.id==="so"){sortk=e.target.value;render()}if(e.target.closest&&e.target.closest("#drv"))updatePick()});
 document.addEventListener("input",e=>{if(e.target.id==="q"){q=e.target.value.toLowerCase();render()}});
-$("#th").onclick=()=>{const h=document.documentElement,n=h.dataset.th==="dark"?"light":"dark";h.dataset.th=n;try{localStorage.setItem("tc_th",n)}catch(e){}};
-$("#again").onclick=()=>{if($("#scan").hidden){$("#scan").hidden=false;showIn($("#scan"))}hideAnimated($("#res"),()=>{$("#again").hidden=true})};
-$("#out").onclick=async()=>{const r=await api("/api/logout",{});stopPoll();ME=null;if(r.csrf)CSRF=r.csrf;resetUI();showAuth("login")};
-$("#del").onclick=()=>{
- const m=$("#modal");
- m.innerHTML=`<div class=sheet role=dialog aria-modal=true aria-labelledby=dh><h3 id=dh>Eliminare account e dati?</h3><p>Verranno cancellati per sempre il tuo account e i dati di accesso salvati su questo computer. I file del computer non vengono toccati.</p><input type=password id=dpw placeholder="Password (se l'account ne ha una)" autocomplete=current-password maxlength=128 aria-label="Password per confermare"><div id=de class=fe role=alert></div><div class=sb><button type=button class=btn id=dn>Annulla</button><button type=button class=pri id=dy>Elimina tutto</button></div></div>`;
- m._tok=(m._tok||0)+1;m.hidden=false;m.classList.remove("leaving");const close=()=>hideAnimated(m,()=>{m.innerHTML=""});
- $("#dpw").focus();$("#dn").onclick=close;
- $("#dy").onclick=async()=>{const b=$("#dy");b.disabled=true;const r=await api("/api/delete_account",{password:$("#dpw").value});b.disabled=false;
-  if(r.error){$("#de").textContent=r.error;return}
-  close();stopPoll();ME=null;if(r.csrf)CSRF=r.csrf;resetUI();showAuth("login",()=>fe("Account e dati eliminati.",true))};
-};
-$("#quit").onclick=async()=>{if(await ask("Chiudere Twenties Cleaning?","Il programma verrà chiuso. Per riaprirlo dovrai avviarlo di nuovo.","Chiudi")){await api("/api/quit",{});document.body.innerHTML='<main><div class=card><h2>Programma chiuso</h2><p class=s>Puoi chiudere questa scheda.</p></div></main>'}};
-async function poll(){
- const s=await api("/api/status");if(!s||s.error)return;
- const stepsHtml=Object.entries(STEPS).map(([k,v])=>`<span class="st ${k===s.phase?"on":""}">${v}</span>`).join("");
- const steps=$("#steps");if(steps&&steps.dataset.h!==stepsHtml){steps.dataset.h=stepsHtml;steps.innerHTML=stepsHtml}
- const b=$("#bar"),m=$("#msg");
- if((s.phase==="scan"||s.phase==="done")&&typeof s.count==="number")scanned=s.count;
- if(s.phase==="scan"){if(b)b.hidden=true;if(m)m.textContent=(s.count||0).toLocaleString("it")+" file letti · "+(s.current||"")}
- else if(s.phase==="agg"){if(b)b.hidden=true;if(m)m.textContent="Calcolo le cartelle…"}
- else if(s.phase==="dups"||s.phase==="arch"){if(b){b.hidden=false;b.className="bar";if(b.firstChild)b.firstChild.style.width=(s.done/Math.max(1,s.total)*100)+"%"}if(m)m.textContent=(s.done||0).toLocaleString("it")+" / "+(s.total||0).toLocaleString("it")+" elementi controllati"}
- paintStatus();
- if(s.phase==="done"||s.phase==="idle"){
-  stopPoll();setText($("#go"),"Avvia analisi");
-  if(s.error){$("#prog").hidden=true;toast("Errore: "+s.error);return}
-  if(s.phase==="done"){R=await api("/api/results");sel.clear();tab="home";if(R&&R.folders){idx();render()}else $("#prog").hidden=true}
-  else $("#prog").hidden=true}}
-$("#go").onclick=async()=>{
- if(running){await api("/api/stop",{});setText($("#go"),"Interrompo…");return}
- const roots=[...document.querySelectorAll("#drv input:checked")].map(i=>i.value),c=$("#custom").value.trim();if(c)roots.push(c);
- if(!roots.length)return toast("Seleziona almeno un disco o scrivi una cartella.");
- const r=await api("/api/start",{roots,dups:$("#dups").checked,arch:$("#arch").checked,minmb:+$("#minmb").value||5});
- if(r.error)return toast(r.error);
- running=true;scanned=0;setText($("#go"),"Ferma");$("#prog").hidden=false;showIn($("#prog"));paintStatus();
- try{$("#prog").scrollIntoView({behavior:REDUCE()?"auto":"smooth",block:"nearest"})}catch(e){}
- timer=setInterval(poll,600);poll()};
-(async()=>{
- const m=await api("/api/me");CSRF=m.csrf||"";ME=m.user||null;GOOGLE=!!m.google;MAIL=!!m.mail;PLAT=OSN[m.platform]?m.platform:"linux";
- const p=new URLSearchParams(location.search);
- if(location.pathname==="/reset"){RT=(p.get("token")||"").slice(0,100);history.replaceState(null,"","/")}
- else if(p.get("e")){FLASH=EMSG[p.get("e")]||null;history.replaceState(null,"","/")}
- let seen=false;try{seen=localStorage.getItem("tc_intro")==="1"}catch(e){}
- if(!seen&&!ME&&!RT){$("#intro").hidden=false;slide(0)}else route()})();
+document.addEventListener("mousemove",e=>{const seg=e.target.closest&&e.target.closest(".seg");const tip=$("#tip");if(!seg||!R){tip.hidden=true;return}const n=findNode(seg.dataset.id,(R.map)||[]);if(!n){tip.hidden=true;return}tip.hidden=false;tip.innerHTML=`<b>${esc(n.name)}</b><br>${fmt(n.size)} · ${esc(n.cat?t(CK[n.cat]||"cat.media"):"")}<br>${esc(whyOf(n))}`;tip.style.left=Math.min(window.innerWidth-300,e.clientX+14)+"px";tip.style.top=(e.clientY+14)+"px"});
+$("#th").onclick=()=>{const h=document.documentElement,n=h.dataset.th==="dark"?"light":"dark";h.dataset.th=n;try{localStorage.setItem("tc_th",n)}catch(e){}if(tab==="map"&&R)drawMap()};
+$("#again").onclick=()=>{$("#scan").hidden=false;$("#res").hidden=true;$("#again").hidden=true};
+$("#acct").onclick=async()=>{if(!ME)return showAuth("login");const r=await api("/api/logout",{});stopPoll();ME=null;if(r.csrf)CSRF=r.csrf;paintAcct();toast(t("logout.done"))};
+$("#quit").onclick=async()=>{if(await ask(t("close.ask.title"),t("close.ask.body"),t("close.ask.ok"))){await api("/api/quit",{});document.body.innerHTML='<main><div class=card><h2>'+esc(t("closed.title"))+'</h2><p class=s>'+esc(t("closed.body"))+'</p></div></main>'}};
+$("#gear").onclick=async()=>{const m=$("#modal");const hist=await api("/api/history");const items=Array.isArray(hist)?hist:[];m.innerHTML=`<div class="sheet wide" role=dialog><h3>${esc(t("settings.title"))}</h3>
+<div class=setrow><div><b>${esc(t("settings.lang"))}</b><p>${esc(t("settings.lang.why"))}</p></div><select id=slang><option value=it ${LANG==="it"?"selected":""}>Italiano</option><option value=en ${LANG==="en"?"selected":""}>English</option></select></div>
+<div class=setrow><div><b>${esc(t("settings.updates"))}</b><p>${esc(t("settings.updates.why"))}</p></div><input type=checkbox id=supd ${UPDATES?"checked":""}></div>
+<div class=setrow><div><b>${esc(t("settings.schedule"))}</b><p>${esc(t("settings.schedule.why"))}</p></div><input type=checkbox id=ssc ${SCHED&&SCHED.enabled?"checked":""}></div>
+<div class=setrow><div><b>${esc(t("settings.days"))}</b></div><input type=number id=sdays min=1 max=90 value="${(SCHED&&SCHED.days)||7}" style="width:80px"></div>
+<div class=setrow><div><b>${esc(t("settings.account"))}</b><p>${esc(ME?ME.email:t("who.guest"))}</p></div><div class=r>${ME?`<button class=btn id=sdel>${esc(t("settings.delete"))}</button>`:`<button class=btn id=slog>${esc(t("account"))}</button>`}</div></div>
+<h3 style="margin-top:8px">${esc(t("settings.history"))}</h3>${items.length?items.slice(0,12).map(x=>`<div class=hitem>${esc(x.summary||x.kind)} ${x.can_undo?`<button class=btn data-undo="${x.id}">${esc(t("settings.undo"))}</button>`:""}</div>`).join(""):`<p class=s>${esc(t("settings.history.empty"))}</p>`}
+<div class=sb style="margin-top:16px"><button class=btn id=sclose>${esc(t("common.close"))}</button></div></div>`;m.hidden=false;
+$("#sclose").onclick=()=>{m.hidden=true;m.innerHTML=""};
+$("#slang").onchange=async()=>{const r=await api("/api/lang",{lang:$("#slang").value});if(r&&r.lang){LANG=r.lang;applyLang();paintAcct();hello();if(R&&!$("#res").hidden)render();else paintStatus()}};
+$("#supd").onchange=async()=>{UPDATES=$("#supd").checked;await api("/api/settings",{updates:UPDATES});if(UPDATES)checkUpdates();else $("#upd").hidden=true};
+$("#ssc").onchange=async()=>{const on=$("#ssc").checked;const days=+$("#sdays").value||7;const r=await api("/api/settings",{schedule:on,schedule_days:days});if(r&&r.schedule)SCHED=r.schedule;showSchedule()};
+const slog=$("#slog");if(slog)slog.onclick=()=>{m.hidden=true;showAuth("login")};
+const sdel=$("#sdel");if(sdel)sdel.onclick=()=>deleteAccount();
+m.querySelectorAll("[data-undo]").forEach(b=>b.onclick=()=>doUndo(+b.dataset.undo))};
+function deleteAccount(){const m=$("#modal");m.innerHTML=`<div class=sheet role=dialog><h3>${esc(t("delete.title"))}</h3><p>${esc(t("delete.body"))}</p><input type=password id=dpw placeholder="${esc(t("delete.pw"))}" maxlength=128><div id=de class=fe></div><div class=sb><button class=btn id=dn>${esc(t("common.cancel"))}</button><button class=pri id=dy>${esc(t("delete.ok"))}</button></div></div>`;m.hidden=false;$("#dn").onclick=()=>{m.hidden=true};$("#dy").onclick=async()=>{const r=await api("/api/delete_account",{password:$("#dpw").value});if(r.error){$("#de").textContent=r.error;return}m.hidden=true;stopPoll();ME=null;if(r.csrf)CSRF=r.csrf;paintAcct();toast(t("delete.done"))}}
+$("#go").onclick=async()=>{if(running){await api("/api/stop",{});$("#go").textContent=t("stopping");return}const roots=[...document.querySelectorAll("#drv input:checked")].map(i=>i.value);const c=$("#custom").value.trim();if(c)roots.push(c);if(!roots.length)return toast(t("need.root"));const r=await api("/api/start",{roots,dups:$("#dups").checked,arch:$("#arch").checked,minmb:+$("#minmb").value||5});if(r.error)return toast(r.error);running=true;scanned=0;$("#go").textContent=t("stop");$("#prog").hidden=false;paintStatus();timer=setInterval(poll,600);poll()};
+async function poll(){const s=await api("/api/status");if(!s||s.error)return;const steps=$("#steps");if(steps)steps.innerHTML=Object.keys(STEPK).map(k=>`<span class="st ${k===s.phase?"on":""}">${esc(t(STEPK[k]))}</span>`).join("");const b=$("#bar"),m=$("#msg");if((s.phase==="scan"||s.phase==="done")&&typeof s.count==="number")scanned=s.count;if(s.phase==="scan"){if(b)b.hidden=true;if(m)m.textContent=tf("scan.files",{n:(s.count||0).toLocaleString(loc()),p:s.current||""})}else if(s.phase==="agg"){if(m)m.textContent=t("scan.agg")}else if(s.phase==="dups"||s.phase==="arch"){if(b){b.hidden=false;if(b.firstChild)b.firstChild.style.width=(s.done/Math.max(1,s.total)*100)+"%"}if(m)m.textContent=tf("scan.checked",{d:(s.done||0).toLocaleString(loc()),t:(s.total||0).toLocaleString(loc())})}paintStatus();if(s.phase==="done"||s.phase==="idle"){stopPoll();$("#go").textContent=t("go");if(s.error){$("#prog").hidden=true;toast(s.error);return}if(s.phase==="done"){R=await api("/api/results");sel.clear();tab="home";if(R&&R.folders){idx();render()}else $("#prog").hidden=true}else $("#prog").hidden=true}}
+(async()=>{const m=await api("/api/me");CSRF=m.csrf||"";ME=m.user||null;GOOGLE=!!m.google;MAIL=!!m.mail;PLAT=(m.platform==="mac"||m.platform==="win")?m.platform:"linux";LANG=m.lang==="en"?"en":"it";UPDATES=!!m.updates;SCHED=m.schedule||{enabled:false,due:false,days:7};applyLang();const p=new URLSearchParams(location.search);if(location.pathname==="/reset"){RT=(p.get("token")||"").slice(0,100);history.replaceState(null,"","/")}else if(p.get("e")){const map={google_off:t("auth.google.off"),google_fail:t("google.fail"),rate:t("err.rate")};FLASH=map[p.get("e")]||null;history.replaceState(null,"","/")}let seen=false;try{seen=localStorage.getItem("tc_onboard")==="1"||localStorage.getItem("tc_intro")==="1"}catch(e){}if(SHOT)seen=true;if(!seen&&!m.onboarded&&!RT){$("#intro").hidden=false;slide(0)}else if(RT)showAuth("reset");else enterApp()})();
 </script></body></html>
 """
-
 
 def env_on(name):
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
@@ -1953,14 +2293,14 @@ def finish_because_busy(kind, info, port):
         raise SystemExit(0)
     if kind == "old":
         give_up(1, (
-            f"Twenties Cleaning non si è avviato.\n\n"
+            f"{APP} non si è avviato.\n\n"
             f"La porta {port} è già usata da una versione precedente del programma, ancora aperta su questo computer. "
             f"Se ne aprissi un'altra vedresti la schermata vecchia.\n\n"
             f"Chiudi quella copia (dalla barra delle applicazioni, oppure da Gestione attività su Windows "
-            f"o Monitoraggio Attività su Mac) e riapri Twenties Cleaning."
+            f"o Monitoraggio Attività su Mac) e riapri {APP}."
         ))
     give_up(1, (
-        f"Twenties Cleaning non si è avviato.\n\n"
+        f"{APP} non si è avviato.\n\n"
         f"La porta {port} è occupata da un altro programma. Chiudilo e riprova. "
         f"Non ho avviato una seconda copia."
     ))
@@ -2036,7 +2376,7 @@ def run_window(srv, th, folder):
     icon = app_icon()
     try:
         WINDOW = webview.create_window(APP, BASE + "/", js_api=DesktopBridge(), width=1280, height=820,
-                                       min_size=(900, 640), background_color="#f5f5f7")
+                                       min_size=(900, 640), background_color="#F3EEE6")
         WINDOW_MODE = True
 
         def on_shown():
@@ -2072,10 +2412,11 @@ def run_window(srv, th, folder):
 
 
 FALLBACK_MSG = (
-    "Non riesco ad aprire la finestra di Twenties Cleaning.\n\n"
+    "Non riesco ad aprire la finestra di Twenties.\n\n"
     "Manca il componente di sistema (su Windows serve WebView2, già presente su Windows 11 e sulla maggior parte di Windows 10).\n\n"
     "Apro il programma nel browser."
 )
+FALLBACK_LOGO = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#0B0C12"/><text x="32" y="44" text-anchor="middle" font-size="28" font-family="sans-serif" font-weight="700" fill="#fff">20</text></svg>'
 
 
 def main():
@@ -2095,6 +2436,8 @@ def main():
         import ctypes
         if not ctypes.windll.shell32.IsUserAnAdmin():
             print("Nota: non sei Amministratore, alcune cartelle protette verranno saltate.")
+    global SYSTEM_LANG
+    SYSTEM_LANG = detect_lang()
     d = data_dir()
     log_to_file(d)
     load_env(d)
