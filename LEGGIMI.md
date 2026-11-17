@@ -1,58 +1,50 @@
-# Twenties Cleaning
+# Twenties
 
-> Questa guida è per chi avvia il programma **da codice sorgente**. Se hai scaricato il .exe o il .dmg dalle Releases, aprilo: compare la finestra dell'app. Non serve Python.
-
-## Avvio da codice sorgente
-
-Serve Python 3.8 o più recente.
+Per chi avvia il programma dal codice. Se hai scaricato l'exe o il dmg, aprilo e basta.
 
 ```
 pip install -r requirements.txt
 python src/twenties_cleaning.py
 ```
 
-Su Mac il comando è `python3` (oppure doppio clic su `run_mac.command`). Su Windows puoi usare `run_windows.bat`.
+Su Mac il comando è `python3`, oppure `run_mac.command`. Su Windows c'è `run_windows.bat`.
 
-Si apre una finestra intitolata **Twenties Cleaning**. Chiudendola, il programma termina e libera la porta.
+La finestra si chiama Twenties. Chiudendola, il programma termina. Si può scansionare senza account.
 
-- Per usare il browser al posto della finestra: `python src/twenties_cleaning.py --browser`
-- Per i test automatici, senza finestra e senza browser: `python src/twenties_cleaning.py --headless` (oppure la variabile `TC_HEADLESS=1`)
+- Browser al posto della finestra: `python src/twenties_cleaning.py --browser`
+- Senza finestra, per i test: `python src/twenties_cleaning.py --headless`
 
-Se la finestra non si apre (su Windows manca WebView2, già presente su Windows 11), il programma lo dice e apre il browser.
+Se la finestra non si apre, manca WebView2 (su Windows 11 c'è già). In quel caso si apre il browser.
 
-- **Mac**, cartelle protette: Impostazioni di Sistema › Privacy e sicurezza › **Accesso completo al disco** → aggiungi Terminale (se avvii da script) oppure Twenties Cleaning.
-  Al primo spostamento nel Cestino macOS chiede di far controllare Finder: consenti.
-  Se usi Python di python.org e Google dà errore di certificati: esegui `Install Certificates.command` nella cartella Python.
-- **Windows**: per leggere anche le cartelle protette, avvia il programma come Amministratore.
+Su Mac, per le cartelle protette: Impostazioni di Sistema, Privacy e sicurezza, Accesso completo al disco. Al primo spostamento nel Cestino, consenti il controllo di Finder.
 
-Se compare «è già aperto» o «porta occupata», c'è già una copia in esecuzione (anche una versione vecchia). Chiudila da Gestione attività (Windows) o Monitoraggio Attività (Mac) e riapri. Non parte una seconda copia, così non vedi la schermata vecchia.
+I percorsi con spazi, OneDrive e lettere accentate vanno bene.
 
-## Credenziali Google in locale
+Se dice che è già aperto, chiudi l'altra copia da Gestione attività o da Monitoraggio Attività.
 
-L'accesso con Google è facoltativo. Le versioni ufficiali lo hanno già dentro (dai secret di GitHub, non dal codice). In locale puoi dare le tue credenziali in uno di questi modi, **senza committarle**:
+## Dati
 
-1. Variabili d'ambiente `GOOGLE_CLIENT_ID` e `GOOGLE_CLIENT_SECRET`.
-2. File `src/_google_config.py` (è nel `.gitignore`):
+La cartella si chiama ancora `TwentiesCleaning`, così un account vecchio resta dov'era.
 
-```python
-CLIENT_ID = "....apps.googleusercontent.com"
-CLIENT_SECRET = "...."
-```
+- Mac: `~/Library/Application Support/TwentiesCleaning/`
+- Windows: `%APPDATA%\TwentiesCleaning\`
 
-In Google Cloud Console crea un ID client OAuth di tipo «Applicazione web» e aggiungi questo URI di reindirizzamento:
+L'account è facoltativo. Email e password, se le crei, restano in quel file.
 
-`http://127.0.0.1:8765/auth/google/callback`
+Google, se lo configuri, si apre nel browser di sistema. In locale: variabili `GOOGLE_CLIENT_ID` e `GOOGLE_CLIENT_SECRET`, oppure `src/_google_config.py` (è nel `.gitignore`). In Google Cloud l'URI di reindirizzamento è `http://127.0.0.1:8765/auth/google/callback`.
 
-Il consenso di Google si apre nel browser di sistema: Google blocca il login dentro la finestra dell'app. Quando hai finito, la finestra di Twenties Cleaning risulta già connessa. Puoi chiudere la scheda del browser.
+## Impostazioni
 
-In alternativa vale ancora il file `.env` nella cartella dati (Mac: `~/Library/Application Support/TwentiesCleaning/`, Windows: `%APPDATA%\TwentiesCleaning\`) con le stesse due variabili.
+Lingua: quella del sistema, italiano o inglese. Si cambia in Impostazioni.
 
-## Reset password
+Avviso di versione: spento. Se lo accendi, legge solo il numero dell'ultima release su GitHub.
 
-Senza server di posta il link compare nel Terminale (solo se avvii da codice; nell'app scaricabile non è disponibile) (valido 15 minuti, monouso). Per l'email aggiungi a `.env`:
-`SMTP_HOST`, `SMTP_PORT` (587 o 465), `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`.
+Promemoria scarto: spento. Se lo accendi, mostra un elenco e sposta nel Cestino solo se confermi.
 
-## HTTPS
+La cronologia tiene gli spostamenti. Annulla rimette il file al posto quando il Cestino lo permette ancora.
 
-Il programma ascolta solo su 127.0.0.1. Per attivare HTTPS: `brew install mkcert && mkcert -install && mkcert 127.0.0.1`, poi
-`TC_TLS_CERT=127.0.0.1.pem TC_TLS_KEY=127.0.0.1-key.pem python3 src/twenties_cleaning.py`
+## Posta e HTTPS
+
+Senza server di posta, il link per la password compare nel terminale solo se avvii da codice. Vale 15 minuti, una volta sola. Per l'email, nel `.env` della cartella dati: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`.
+
+Il programma ascolta solo su 127.0.0.1. Per HTTPS: `mkcert -install && mkcert 127.0.0.1`, poi `TC_TLS_CERT` e `TC_TLS_KEY`.

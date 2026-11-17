@@ -8,8 +8,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, "src", "twenties_cleaning.py")
 s = socket.socket(); s.bind(("127.0.0.1", 0)); PORT = s.getsockname()[1]; s.close()
 tmp = tempfile.mkdtemp()
+FIXTURE = os.path.join(tmp, "release.json")
 env = dict(os.environ, TC_PORT=str(PORT), TC_HEADLESS="1", HOME=tmp, USERPROFILE=tmp, APPDATA=tmp, XDG_DATA_HOME=tmp,
-            BROWSER="true", PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+            BROWSER="true", PYTHONUTF8="1", PYTHONIOENCODING="utf-8", TC_UPDATE_FIXTURE=FIXTURE)
 proc = subprocess.Popen([sys.executable, APP, "--headless"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 jar = {}
 
@@ -65,6 +66,53 @@ try:
         raise SystemExit("il server non si avvia")
     csrf = me["csrf"]
     check("server risponde, nessun utente", st == 200 and me["user"] is None)
+    st, drives = req("GET", "/api/drives")
+    check("dischi senza account", st == 200 and isinstance(drives, list))
+    st, mp = req("GET", "/api/map")
+    check("mappa vuota prima dell'analisi", st == 200 and mp.get("roots") == [])
+    st, settings = req("GET", "/api/settings")
+    check("promemoria scarto spento", st == 200 and settings.get("schedule", {}).get("enabled") is False and settings.get("schedule", {}).get("due") is False)
+    st, i18n = req("GET", "/api/i18n")
+    cat = i18n.get("catalog") or {}
+    check("lingue it e en", st == 200 and cat.get("it", {}).get("tagline") == "Vedi cosa pesa. Decidi tu."
+          and cat.get("en", {}).get("tagline") == "See what takes space. You decide.")
+    st, upd = req("POST", "/api/update_check", {}, csrf)
+    check("controllo versione senza consenso e senza rete", st == 200 and upd.get("consent") is False and "latest" not in upd)
+    st, lang = req("POST", "/api/lang", {"lang": "en"}, csrf)
+    check("selettore inglese", st == 200 and lang.get("lang") == "en" and lang.get("tagline") == "See what takes space. You decide.")
+    st, lang = req("POST", "/api/lang", {"lang": "it"}, csrf)
+    check("selettore italiano", st == 200 and lang.get("lang") == "it")
+    open(FIXTURE, "w", encoding="utf-8").write(json.dumps({
+        "tag_name": "v9.9.9",
+        "html_url": "https://github.com/twoventi/twenties-cleaning/releases/tag/v9.9.9"}))
+    st, _ = req("POST", "/api/settings", {"updates": True}, csrf)
+    check("consenso aggiornamenti", st == 200)
+    st, upd = req("POST", "/api/update_check", {}, csrf)
+    check("versione più nuova segnalata", st == 200 and upd.get("consent") is True and upd.get("update") is True and upd.get("latest") == "9.9.9")
+    open(FIXTURE, "w", encoding="utf-8").write(json.dumps({"tag_name": "v0.0.1", "html_url": "https://github.com/twoventi/twenties-cleaning/releases/tag/v0.0.1"}))
+    st, upd = req("POST", "/api/update_check", {}, csrf)
+    check("versione più vecchia ignorata", st == 200 and upd.get("update") is False and upd.get("current") == "2.0.0")
+    st, _ = req("POST", "/api/settings", {"updates": False}, csrf)
+    scan_root = os.path.join(tmp, "OneDrive")
+    accent = os.path.join(scan_root, "Cartella èà")
+    os.makedirs(os.path.join(accent, "cache"), exist_ok=True)
+    with open(os.path.join(accent, "cache", "nota.log"), "wb") as f:
+        f.write(b"x" * 4096)
+    with open(os.path.join(accent, "appunti.txt"), "w", encoding="utf-8") as f:
+        f.write("ciao")
+    st, started = req("POST", "/api/start", {"roots": [scan_root], "dups": False, "arch": False, "minmb": 1}, csrf)
+    check("analisi senza account", st == 200 and "error" not in started, str(started))
+    phase = ""
+    for _ in range(40):
+        st, phase_body = req("GET", "/api/status")
+        phase = phase_body.get("phase")
+        if phase in ("done", "idle"):
+            break
+        time.sleep(0.25)
+    check("analisi conclusa", phase == "done" and not phase_body.get("error"), str(phase_body))
+    st, mp = req("GET", "/api/map")
+    blob = json.dumps(mp, ensure_ascii=False)
+    check("mappa con percorso accentato", st == 200 and "Cartella èà" in blob and mp.get("roots"))
     st, r = req("POST", "/api/register", {"email": "prova@example.com", "password": "correct-horse-9"}, csrf)
     check("registrazione", st == 200)
     csrf = r["csrf"]
@@ -76,7 +124,7 @@ try:
     csrf = r["csrf"]
     check("sessione chiusa dopo l'eliminazione", req("GET", "/api/me")[1]["user"] is None)
     check("accesso impossibile dopo l'eliminazione", req("POST", "/api/login", {"email": "prova@example.com", "password": "correct-horse-9"}, csrf)[0] == 401)
-    check("modalità senza finestra", me.get("app") == "Twenties Cleaning" and bool(me.get("version")) and me.get("window") is False)
+    check("modalità senza finestra", me.get("app") == "Twenties" and me.get("version") == "2.0.0" and me.get("window") is False)
     c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
     c.request("GET", "/auth/finish?t=not-a-real-ticket", headers={"Host": f"127.0.0.1:{PORT}"})
     rr = c.getresponse(); loc = rr.getheader("Location") or ""; rr.read()

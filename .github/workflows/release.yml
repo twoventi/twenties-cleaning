@@ -23,13 +23,13 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         run: python scripts/write_google_config.py
       - name: Build
-        run: pyinstaller --noconfirm --onefile --windowed --name Twenties-Cleaning --icon assets/icon.ico --add-data "assets/icon.ico;assets" --add-data "assets/icon.png;assets" --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr --hidden-import bottle --hidden-import proxy_tools --hidden-import webview --hidden-import webview.platforms.edgechromium --hidden-import webview.platforms.winforms src/twenties_cleaning.py
+        run: pyinstaller --noconfirm --onefile --windowed --name Twenties --icon assets/icon.ico --add-data "assets/icon.ico;assets" --add-data "assets/icon.png;assets" --add-data "assets/logo.svg;assets" --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr --hidden-import bottle --hidden-import proxy_tools --hidden-import webview --hidden-import webview.platforms.edgechromium --hidden-import webview.platforms.winforms src/twenties_cleaning.py
       - name: Smoke test (the built app must start and answer)
         shell: pwsh
         run: |
           $env:TC_PORT = "8795"
           $env:TC_HEADLESS = "1"
-          $p = Start-Process -FilePath "dist/Twenties-Cleaning.exe" -PassThru
+          $p = Start-Process -FilePath "dist/Twenties.exe" -PassThru
           $ok = $false
           foreach ($i in 1..30) {
             Start-Sleep -Seconds 2
@@ -37,27 +37,38 @@ jobs:
           }
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           if (-not $ok) { throw "Smoke test failed: the app did not answer" }
-      - run: Move-Item dist/Twenties-Cleaning.exe Twenties-Cleaning-Windows.exe
+      - run: Move-Item dist/Twenties.exe Twenties-Windows.exe
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: Twenties-Cleaning-Windows.exe
+          path: Twenties-Windows.exe
 
-  intel:
+  macos:
     runs-on: macos-15-intel
-    env:
-      MAC_SUFFIX: Intel
-    steps: &mac-build
+    continue-on-error: true
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install --upgrade pip pyinstaller -r requirements.txt
+      - name: Python universal2 ufficiale
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/python.pkg https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg
+          sudo installer -pkg /tmp/python.pkg -target /
+          PY=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+          "$PY" -c "import sys; print(sys.version)"
+          lipo -info "$PY"
+      - name: Dipendenze
+        run: |
+          set -euo pipefail
+          PY=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+          "$PY" -m pip install --upgrade pip pyinstaller -r requirements.txt
       - name: Credenziali Google (dai secret, non dal codice)
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-        run: python scripts/write_google_config.py
+        run: /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 scripts/write_google_config.py
       - name: Make .icns icon
         run: |
           mkdir icon.iconset
@@ -66,16 +77,22 @@ jobs:
             sips -z $((s*2)) $((s*2)) assets/icon.png --out icon.iconset/icon_${s}x${s}@2x.png
           done
           iconutil -c icns icon.iconset -o assets/icon.icns
-      - name: Build
-        run: pyinstaller --noconfirm --windowed --name "Twenties Cleaning" --icon assets/icon.icns --osx-bundle-identifier "io.github.${{ github.repository_owner }}.twentiescleaning" --add-data "assets/icon.png:assets" --add-data "assets/icon.icns:assets" --collect-all webview --hidden-import objc --hidden-import AppKit --hidden-import Foundation --hidden-import WebKit --hidden-import UniformTypeIdentifiers --hidden-import PyObjCTools.AppHelper --hidden-import bottle --hidden-import proxy_tools --hidden-import webview src/twenties_cleaning.py
+      - name: Build universal2
+        run: |
+          set -euo pipefail
+          PY=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+          "$PY" -m PyInstaller --noconfirm --windowed --target-arch universal2 --name "Twenties" --icon assets/icon.icns --osx-bundle-identifier "io.github.${{ github.repository_owner }}.twentiescleaning" --add-data "assets/icon.png:assets" --add-data "assets/icon.icns:assets" --add-data "assets/logo.svg:assets" --collect-all webview --hidden-import objc --hidden-import AppKit --hidden-import Foundation --hidden-import WebKit --hidden-import UniformTypeIdentifiers --hidden-import PyObjCTools.AppHelper --hidden-import bottle --hidden-import proxy_tools --hidden-import webview src/twenties_cleaning.py
       - name: Finder permission text and ad-hoc signature
         run: |
-          /usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string Twenties Cleaning usa Finder solo per spostare nel Cestino i file che scegli." "dist/Twenties Cleaning.app/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" -c "Add :NSAppTransportSecurity:NSAllowsLocalNetworking bool true" "dist/Twenties Cleaning.app/Contents/Info.plist"
-          codesign --force --deep --sign - "dist/Twenties Cleaning.app"
+          /usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string Twenties usa Finder solo per spostare nel Cestino i file che scegli." "dist/Twenties.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" -c "Add :NSAppTransportSecurity:NSAllowsLocalNetworking bool true" "dist/Twenties.app/Contents/Info.plist"
+          codesign --force --deep --sign - "dist/Twenties.app"
+          lipo -info "dist/Twenties.app/Contents/MacOS/Twenties"
+          lipo -info "dist/Twenties.app/Contents/MacOS/Twenties" | grep -q x86_64
+          lipo -info "dist/Twenties.app/Contents/MacOS/Twenties" | grep -q arm64
       - name: Smoke test (the built app must start and answer)
         run: |
-          TC_HEADLESS=1 TC_PORT=8795 "dist/Twenties Cleaning.app/Contents/MacOS/Twenties Cleaning" &
+          TC_HEADLESS=1 TC_PORT=8795 "dist/Twenties.app/Contents/MacOS/Twenties" &
           APP_PID=$!
           ok=0
           for i in $(seq 1 30); do
@@ -87,40 +104,33 @@ jobs:
       - name: Make .dmg
         run: |
           mkdir dmg
-          cp -R "dist/Twenties Cleaning.app" dmg/
+          cp -R "dist/Twenties.app" dmg/
           ln -s /Applications dmg/Applications
-          hdiutil create -volname "Twenties Cleaning" -srcfolder dmg -ov -format UDZO "Twenties-Cleaning-macOS-${MAC_SUFFIX}.dmg"
+          hdiutil create -volname "Twenties" -srcfolder dmg -ov -format UDZO "Twenties-macOS.dmg"
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ env.MAC_SUFFIX }}
-          path: Twenties-Cleaning-macOS-${{ env.MAC_SUFFIX }}.dmg
-      - name: Aggiungi il dmg Apple Silicon alla release
-        if: success() && env.MAC_SUFFIX == 'AppleSilicon' && startsWith(github.ref, 'refs/tags/v')
+          name: macos
+          path: Twenties-macOS.dmg
+      - name: Aggiungi il dmg alla release, se c'è già
+        if: success() && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          file="Twenties-Cleaning-macOS-AppleSilicon.dmg"
+          file="Twenties-macOS.dmg"
           if command -v sha256sum >/dev/null 2>&1; then
             sum="$(sha256sum "$file")"
           else
             sum="$(shasum -a 256 "$file")"
           fi
-          merge_sums() {
-            if [ -f SHA256SUMS ]; then
-              grep -v 'Twenties-Cleaning-macOS-AppleSilicon.dmg' SHA256SUMS > SHA256SUMS.new || true
-            else
-              : > SHA256SUMS.new
-            fi
-            printf '%s\n' "$sum" >> SHA256SUMS.new
-            mv SHA256SUMS.new SHA256SUMS
-          }
           for _ in $(seq 1 30); do
             if gh release view "$tag" >/dev/null 2>&1; then
               rm -f SHA256SUMS
               if gh release download "$tag" --pattern SHA256SUMS --clobber; then
-                merge_sums
+                grep -v 'Twenties-macOS.dmg' SHA256SUMS > SHA256SUMS.new || true
+                printf '%s\n' "$sum" >> SHA256SUMS.new
+                mv SHA256SUMS.new SHA256SUMS
                 gh release upload "$tag" "$file" SHA256SUMS --clobber
               else
                 gh release upload "$tag" "$file" --clobber
@@ -129,22 +139,11 @@ jobs:
             fi
             sleep 10
           done
-          printf '%s\n' "$sum" > SHA256SUMS
-          gh release create "$tag" "$file" SHA256SUMS --generate-notes --title "$tag"
-
-  apple-silicon:
-    runs-on: macos-latest
-    timeout-minutes: 20
-    continue-on-error: true
-    permissions:
-      contents: write
-    env:
-      MAC_SUFFIX: AppleSilicon
-    steps: *mac-build
+          echo "La release di Windows non è ancora pronta: il dmg resta come artifact."
 
   release:
-    needs: [windows, intel]
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.windows.result == 'success' && needs.intel.result == 'success'
+    needs: [windows]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.windows.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -153,20 +152,16 @@ jobs:
         with:
           name: windows
           path: out
-      - uses: actions/download-artifact@v4
-        with:
-          name: macos-Intel
-          path: out
-      - name: dmg Apple Silicon, se il job è riuscito
+      - name: dmg macOS, se il job è già finito
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: macos-AppleSilicon
+          name: macos
           path: out
       - name: Checksums
         run: |
           cd out
-          sha256sum Twenties-Cleaning-* > SHA256SUMS
+          sha256sum Twenties-* > SHA256SUMS
           ls -l
       - uses: softprops/action-gh-release@v2
         with:
