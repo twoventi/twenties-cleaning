@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Twenties Cleaning - analizza lo spazio del PC / Mac: cartelle, giochi, doppioni, archivi gia' estratti.
-Solo libreria standard di Python (3.8+). Elimina solo su tua conferma e solo verso il Cestino.
-Avvio:  python3 twenties_cleaning.py   -> si apre il browser con l'app (accesso con account).
+Python 3.8+ e pywebview per la finestra (se manca, si apre il browser). Elimina solo su tua conferma e solo verso il Cestino.
+Avvio:  python3 src/twenties_cleaning.py   -> finestra dell'app (accesso con account).
 Windows, macOS e Linux. Vedi LEGGIMI per Google, HTTPS e posta."""
 import os, re, sys, json, time, stat, heapq, string, shutil, zipfile, tarfile, hashlib, secrets, threading, subprocess, webbrowser
-import sqlite3, hmac, base64, ssl, smtplib, traceback, urllib.request, urllib.parse
+import errno, socket, sqlite3, hmac, base64, ssl, smtplib, traceback, urllib.request, urllib.parse, urllib.error
 from email.message import EmailMessage
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -575,7 +575,7 @@ def do_trash(paths):
 #  Account, sicurezza e server web (solo 127.0.0.1)
 # ====================================================================================
 APP = "Twenties Cleaning"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HOST = "127.0.0.1"
 PLATFORM = "win" if IS_WIN else "mac" if IS_MAC else "linux"
 PORT, SCHEME, BASE, TLS_ON = 8765, "http", "", False
@@ -587,9 +587,12 @@ PWSEM = threading.BoundedSemaphore(4)
 DBL, CON = threading.Lock(), None
 G_ID = G_SECRET = ""
 OAUTH, OAL = {}, threading.Lock()
-HANDOFF, WINDOW, WINDOW_MODE = {}, None, False  # passaggio dell'accesso Google dal browser alla finestra dell'app
+HANDOFF, HL = {}, threading.Lock()  # ticket monouso: il browser di sistema non condivide i cookie con la finestra
+WINDOW, WINDOW_MODE = None, False
+MODE = "window"                     # window | browser | headless
 DONE_PAGE = '<!doctype html><meta charset="utf-8"><title>Twenties Cleaning</title><body><h2>%s</h2><p>%s</p></body>'
 TOKRE, PRERE = re.compile(r"[A-Za-z0-9_-]{43}"), re.compile(r"[A-Za-z0-9_-]{32}")
+TIKRE = re.compile(r"[A-Za-z0-9_-]{16,80}")
 EMAIL_RE = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
                       r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+")
 COMMON = {"password", "password1", "password123", "1234567890", "12345678910", "qwertyuiop", "iloveyou123",
@@ -949,7 +952,7 @@ class H(BaseHTTPRequestHandler):
                 return self.err(403, "Host non consentito")
             u = urllib.parse.urlsplit(self.path)
             p, qs = u.path, urllib.parse.parse_qs(u.query)
-            if self.headers.get("Host", "").split(":")[0] != "127.0.0.1" and p in ("/", "/reset", "/auth/google", "/auth/google/callback"):
+            if self.headers.get("Host", "").split(":")[0] != "127.0.0.1" and p in ("/", "/reset", "/auth/google", "/auth/google/callback", "/auth/finish"):
                 return self.redirect(BASE + p + ("?" + u.query if u.query else ""))
             ip, s = self.client_address[0], self.session()
             if p in ("/", "/reset"):
@@ -961,19 +964,16 @@ class H(BaseHTTPRequestHandler):
                 b = ("s:" + s["sid"]) if s else "p:" + pre
                 return self.jout({"user": {"email": s["email"], "name": s["name"]} if s else None, "csrf": csrf_for(b),
                                   "google": bool(G_ID and G_SECRET), "mail": bool(os.environ.get("SMTP_HOST")),
-                                  "platform": PLATFORM}, cookies=ck)
-            if p == "/api/focus":  # una seconda copia dell'app chiede di riportare in primo piano la finestra già aperta
-                if WINDOW is not None:
-                    for fn in ("restore", "show"):
-                        try:
-                            getattr(WINDOW, fn)()
-                        except Exception:
-                            pass
-                return self.jout({"app": APP, "window": WINDOW_MODE})
+                                  "platform": PLATFORM, "app": APP, "version": VERSION, "window": WINDOW_MODE}, cookies=ck)
+            if p == "/api/focus":  # una seconda copia della STESSA versione chiede di riportare in primo piano la finestra
+                self.raise_window()
+                return self.jout({"app": APP, "version": VERSION, "window": WINDOW_MODE})
             if p == "/auth/google":
                 return self.google_start(ip, (qs.get("t") or [""])[0])
             if p == "/auth/google/callback":
                 return self.google_cb(qs)
+            if p == "/auth/finish":
+                return self.auth_finish((qs.get("t") or [""])[0])
             if p in ("/api/drives", "/api/status", "/api/results"):
                 if not s:
                     return self.err(401, "Accesso richiesto")
@@ -991,6 +991,21 @@ class H(BaseHTTPRequestHandler):
             self.err(500, "Errore interno")
 
     # ---------- Google
+    def raise_window(self):
+        if WINDOW is None:
+            return
+        try:
+            ready = WINDOW.events.shown.is_set()
+        except Exception:
+            ready = False
+        if not ready:
+            return
+        for fn in ("restore", "show"):
+            try:
+                getattr(WINDOW, fn)()
+            except Exception:
+                pass
+
     def google_start(self, ip, ticket=""):
         if not (G_ID and G_SECRET):
             return self.redirect("/?e=google_off")
@@ -999,12 +1014,14 @@ class H(BaseHTTPRequestHandler):
         RL.add("g:" + ip)
         pre, ck = self.pre_cookie()
         st, ver, nonce, now = secrets.token_urlsafe(24), secrets.token_urlsafe(48), secrets.token_urlsafe(16), time.time()
+        with HL:
+            bound = ticket if (WINDOW_MODE and TIKRE.fullmatch(ticket or "") and ticket in HANDOFF and HANDOFF[ticket][0] is None) else ""
         with OAL:
             for k in [k for k, v in OAUTH.items() if v[3] < now]:
                 del OAUTH[k]
             if len(OAUTH) > 200:
                 OAUTH.clear()
-            OAUTH[st] = (ver, nonce, pre, now + 600, ticket if (WINDOW_MODE and ticket in HANDOFF) else "")
+            OAUTH[st] = (ver, nonce, pre, now + 600, bound)  # il ticket lega questo state OAuth al passaggio verso la finestra
         ch = base64.urlsafe_b64encode(hashlib.sha256(ver.encode()).digest()).rstrip(b"=").decode()
         q = urllib.parse.urlencode({"client_id": G_ID, "redirect_uri": f"{BASE}/auth/google/callback", "response_type": "code",
                                     "scope": "openid email profile", "state": st, "nonce": nonce, "code_challenge": ch,
@@ -1018,8 +1035,10 @@ class H(BaseHTTPRequestHandler):
         tk = ent[4] if ent and len(ent) > 4 else ""
 
         def fail():
-            if tk and tk in HANDOFF:
-                HANDOFF[tk] = ["fail", time.time() + 300]
+            if tk:
+                with HL:
+                    if tk in HANDOFF:
+                        HANDOFF[tk] = ["fail", time.time() + 300]
                 return self.send(200, DONE_PAGE % ("Accesso non riuscito", "Torna a Twenties Cleaning e riprova."), "text/html")
             return self.redirect("/?e=google_fail")
         if not ent or ent[3] < time.time() or not self.pre() or not eq(ent[2], self.pre()) or qs.get("error") or not code or len(code) > 2048:
@@ -1035,41 +1054,61 @@ class H(BaseHTTPRequestHandler):
         if old:
             dbx("DELETE FROM sessions WHERE id=?", (old["sid"],))
         tok, _ = new_session(uid)
-        if tk and tk in HANDOFF:  # app a finestra: la sessione passa alla finestra, non resta nel browser
-            HANDOFF[tk] = [tok, time.time() + 120]
-            return self.send(200, DONE_PAGE % ("Accesso completato", "Puoi chiudere questa scheda e tornare a Twenties Cleaning."), "text/html")
+        if tk:  # la sessione non resta nel browser: la finestra la ritira una sola volta con /auth/finish
+            with HL:
+                if tk in HANDOFF:
+                    HANDOFF[tk] = [tok, time.time() + 120]
+                    return self.send(200, DONE_PAGE % ("Accesso completato", "Puoi chiudere questa scheda e tornare a Twenties Cleaning."), "text/html")
         self.redirect("/", [self.mk(SN, tok)])
+
+    def auth_finish(self, ticket):
+        """Consegna la sessione alla finestra. Il ticket è monouso e nasce insieme allo state OAuth."""
+        if not TIKRE.fullmatch(ticket or ""):
+            return self.redirect("/?e=google_fail")
+        with HL:
+            v = HANDOFF.pop(ticket, None)
+        if not v or v[1] < time.time() or not v[0] or v[0] == "fail":
+            return self.redirect("/?e=google_fail")
+        self.redirect("/", [self.mk(SN, v[0])])
 
     def p_gbegin(self, d, ip):
         if not (G_ID and G_SECRET):
             return self.err(400, "Accesso con Google non disponibile")
-        if not WINDOW_MODE:
+        if not WINDOW_MODE:  # nel browser i cookie sono già i suoi: Google si apre nella stessa finestra
             return self.jout({"same": True})
         now = time.time()
-        for k in [k for k, v in HANDOFF.items() if v[1] < now]:
-            del HANDOFF[k]
-        if len(HANDOFF) > 20:
-            HANDOFF.clear()
-        tk = secrets.token_urlsafe(24)
-        HANDOFF[tk] = [None, now + 300]
+        with HL:
+            for k in [k for k, v in HANDOFF.items() if v[1] < now]:
+                del HANDOFF[k]
+            if len(HANDOFF) > 20:
+                HANDOFF.clear()
+            tk = secrets.token_urlsafe(24)
+            HANDOFF[tk] = [None, now + 300]
         try:
             webbrowser.open(f"{BASE}/auth/google?t={tk}")
         except Exception:
+            with HL:
+                HANDOFF.pop(tk, None)
             return self.err(500, "Non riesco ad aprire il browser")
         self.jout({"ticket": tk})
 
     def p_gpoll(self, d, ip):
-        tk = str(d.get("ticket", ""))[:64]
-        v = HANDOFF.get(tk)
-        if not v or v[1] < time.time():
-            HANDOFF.pop(tk, None)
+        tk = str(d.get("ticket", ""))[:80]
+        if not TIKRE.fullmatch(tk):
+            return self.err(410, "Accesso scaduto")
+        with HL:
+            v = HANDOFF.get(tk)
+            if not v or v[1] < time.time():
+                HANDOFF.pop(tk, None)
+                v = None
+            elif v[0] == "fail":
+                HANDOFF.pop(tk, None)
+        if not v:
             return self.err(410, "Accesso scaduto")
         if v[0] == "fail":
-            HANDOFF.pop(tk, None)
             return self.err(400, "Accesso non riuscito")
         if v[0]:
-            HANDOFF.pop(tk, None)
-            return self.jout({"ok": True}, cookies=[self.mk(SN, v[0])])
+            return self.jout({"ready": True})  # il cookie arriva con la navigazione a /auth/finish, non da qui
         self.jout({"wait": True})
 
     # ---------- POST
@@ -1378,6 +1417,9 @@ h2{font-size:26px;font-weight:700}.s{color:var(--mu);margin:6px 0 16px}
 <div id=modal hidden></div><div id=toast hidden></div>
 <script nonce="__NONCE__">
 "use strict";
+function outside(u){try{const x=new URL(String(u),location.href);return (x.protocol==="http:"||x.protocol==="https:")&&x.host!==location.host}catch(e){return false}}
+document.addEventListener("click",e=>{let n=e.target;while(n&&n!==document){if(n.tagName==="A"&&n.href)break;n=n.parentNode}if(!n||n===document||!outside(n.href))return;const api=window.pywebview&&window.pywebview.api;if(!api||!api.open_external)return;e.preventDefault();e.stopPropagation();api.open_external(n.href)},true);
+const _open=window.open;window.open=function(u){const api=window.pywebview&&window.pywebview.api;if(outside(u)&&api&&api.open_external){api.open_external(String(u));return null}return _open?_open.apply(window,arguments):null};
 const CATS=["Gioco","Scarto","Importanza bassa","Importanza media","Importanza elevata"];
 const PC={"Gioco":"p-g","Scarto":"p-s","Importanza bassa":"p-l","Importanza media":"p-m","Importanza elevata":"p-h"};
 const LEG={"Gioco":"File di giochi. Non toccarli: se non servono, disinstalla dal launcher.","Scarto":"Cache, temporanei, log: di solito eliminabili.","Importanza bassa":"Roba vecchia o riscaricabile (ISO, vecchi video, installer).","Importanza media":"Contenuti recenti e programmi installati.","Importanza elevata":"Documenti, foto, progetti e sistema: da conservare."};
@@ -1405,9 +1447,9 @@ async function api(u,b){
 async function googleGo(){const r=await api("/api/google_begin",{});
  if(!r||r.error){toast(r&&r.error?r.error:"Accesso con Google non disponibile");return}
  if(r.same){location.href="/auth/google";return}
- toast("Completa l'accesso nel browser, poi torna qui…",180000);
- for(let i=0;i<90;i++){await new Promise(z=>setTimeout(z,2000));const q=await api("/api/google_poll",{ticket:r.ticket});
-  if(q&&q.ok){location.reload();return}
+ toast("Completa l'accesso nel browser, poi torna qui…",300000);
+ for(let i=0;i<150;i++){await new Promise(z=>setTimeout(z,2000));const q=await api("/api/google_poll",{ticket:r.ticket});
+  if(q&&q.ready){location.replace("/auth/finish?t="+encodeURIComponent(r.ticket));return}
   if(q&&q.error){toast("Accesso con Google non riuscito. Riprova.");return}}
  toast("Tempo scaduto. Riprova.")}
 function ask(title,body,ok){return new Promise(res=>{const m=$("#modal");m.innerHTML=`<div class=sheet role=dialog aria-modal=true><h3>${esc(title)}</h3><p>${esc(body)}</p><div class=sb><button class=btn data-m=0>Annulla</button><button class=pri data-m=1>${esc(ok)}</button></div></div>`;m.hidden=false;const done=v=>{m.hidden=true;m.innerHTML="";m.onclick=null;res(v)};m.onclick=e=>{const b=e.target.closest("[data-m]");if(b)done(b.dataset.m==="1");else if(e.target===m)done(false)};m.querySelector(".pri").focus()})}
@@ -1568,10 +1610,248 @@ $("#go").onclick=async()=>{
 """
 
 
-def main():
+def env_on(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def launch_mode(argv):
+    args = set(argv[1:])
+    if "--headless" in args or env_on("TC_HEADLESS"):
+        return "headless"
+    if "--browser" in args or env_on("TC_BROWSER"):
+        return "browser"
+    return "window"
+
+
+def console_visible():
+    if getattr(sys, "frozen", False):
+        return False
+    try:
+        return sys.stderr is not None and sys.stderr.isatty()
+    except Exception:
+        return False
+
+
+def notify(msg, error=True):
+    """Messaggio visibile anche nell'eseguibile senza terminale (--windowed)."""
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+    if MODE == "headless" or console_visible():
+        return
+    try:
+        if IS_WIN:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, msg, APP, 0x00000010 if error else 0x00000040)
+        elif IS_MAC:
+            parts = []
+            for line in msg.split("\n"):
+                parts.append('"' + line.replace("\\", "\\\\").replace('"', '\\"') + '"')
+            text = " & return & ".join(parts)
+            icon = "caution" if error else "note"
+            subprocess.run(["osascript", "-e", f'display dialog {text} with title "{APP}" buttons {{"OK"}} default button 1 with icon {icon}'],
+                           check=False, timeout=120)
+        else:
+            subprocess.run(["zenity", "--error" if error else "--info", "--no-wrap", "--title", APP, "--text", msg],
+                           check=False, timeout=120)
+    except Exception:
+        pass
+
+
+def give_up(code, msg):
+    notify(msg, error=code != 0)
+    raise SystemExit(code)
+
+
+def port_is_open(host, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.6)
+    try:
+        return s.connect_ex((host, port)) == 0
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def addr_in_use(exc):
+    n, w = getattr(exc, "errno", None), getattr(exc, "winerror", None)
+    return n in (errno.EADDRINUSE, 98, 48, 10048) or w in (10048,)
+
+
+def local_opener():
+    """Le richieste a 127.0.0.1 non devono passare da un proxy di sistema."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def identify(port):
+    """Chi risponde sulla porta: la nostra versione, una copia precedente, o qualcos'altro."""
+    try:
+        req = urllib.request.Request(f"http://{HOST}:{port}/api/me", headers={"Accept": "application/json"})
+        with local_opener().open(req, timeout=2) as r:
+            server, raw, code = r.headers.get("Server", ""), r.read(65536), r.status
+    except urllib.error.HTTPError as e:
+        server, raw, code = e.headers.get("Server", ""), e.read(65536), e.code
+    except Exception:
+        return "other", None
+    if not str(server).startswith("TwentiesCleaning"):
+        return "other", None
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        data = None
+    if code == 200 and isinstance(data, dict) and data.get("app") == APP and data.get("version") == VERSION:
+        return "ours", data
+    return "old", data
+
+
+def finish_because_busy(kind, info, port):
+    """Non avviare una seconda copia: o si porta avanti quella giusta, o si spiega l'errore."""
+    if kind == "ours":
+        try:
+            local_opener().open(f"http://{HOST}:{port}/api/focus", timeout=3).read()
+        except Exception:
+            pass
+        print(f"{APP} è già aperto: porto in primo piano la finestra esistente.", file=sys.stderr, flush=True)
+        if MODE != "headless" and not (info or {}).get("window"):
+            try:
+                webbrowser.open(f"http://{HOST}:{port}/")
+            except Exception:
+                pass
+        raise SystemExit(0)
+    if kind == "old":
+        give_up(1, (
+            f"Twenties Cleaning non si è avviato.\n\n"
+            f"La porta {port} è già usata da una versione precedente del programma, ancora aperta su questo computer. "
+            f"Se ne aprissi un'altra vedresti la schermata vecchia.\n\n"
+            f"Chiudi quella copia (dalla barra delle applicazioni, oppure da Gestione attività su Windows "
+            f"o Monitoraggio Attività su Mac) e riapri Twenties Cleaning."
+        ))
+    give_up(1, (
+        f"Twenties Cleaning non si è avviato.\n\n"
+        f"La porta {port} è occupata da un altro programma. Chiudilo e riprova. "
+        f"Non ho avviato una seconda copia."
+    ))
+
+
+def app_icon():
+    roots = []
+    if getattr(sys, "frozen", False):
+        me = getattr(sys, "_MEIPASS", "")
+        if me:
+            roots.append(me)
+        roots.append(os.path.dirname(sys.executable))
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots += [os.path.dirname(here), here]
+    names = ("assets/icon.ico", "icon.ico") if IS_WIN else ("assets/icon.png", "assets/icon.icns", "icon.png", "icon.icns")
+    for root in roots:
+        for name in names:
+            p = os.path.join(root, name)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def open_in_browser(url):
+    """Link esterni (e il consenso Google) nel browser di sistema, mai nella finestra dell'app."""
+    try:
+        u = urllib.parse.urlsplit(str(url))
+        port = u.port
+    except Exception:
+        return
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return
+    if u.hostname.lower() in ("127.0.0.1", "localhost") and (port or (443 if u.scheme == "https" else 80)) == PORT:
+        return
+    try:
+        webbrowser.open(u.geturl())
+    except Exception:
+        pass
+
+
+class DesktopBridge:
+    def open_external(self, url):
+        open_in_browser(url)
+
+
+def stop_server(srv, th=None):
+    try:
+        srv.shutdown()
+    except Exception:
+        pass
+    try:
+        srv.server_close()
+    except Exception:
+        pass
+    if th is not None and th.is_alive():
+        th.join(3)
+
+
+def run_window(srv, th, folder):
+    """True se l'utente ha chiuso la finestra (il server è già spento). False se bisogna usare il browser."""
     global WINDOW, WINDOW_MODE
+    shown = {"ok": False}
+    try:
+        import webview
+    except Exception as e:
+        print("Finestra non disponibile:", type(e).__name__, e, file=sys.stderr, flush=True)
+        return False
+    try:
+        webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
+        webview.settings["ALLOW_DOWNLOADS"] = True
+    except Exception:
+        pass
+    icon = app_icon()
+    try:
+        WINDOW = webview.create_window(APP, BASE + "/", js_api=DesktopBridge(), width=1280, height=820,
+                                       min_size=(900, 640), background_color="#f5f5f7")
+        WINDOW_MODE = True
+
+        def on_shown():
+            shown["ok"] = True
+
+        WINDOW.events.shown += on_shown
+        storage = os.path.join(folder, "webview")
+        os.makedirs(storage, exist_ok=True)
+        if not IS_WIN:
+            try:
+                os.chmod(storage, 0o700)
+            except OSError:
+                pass
+        kw = {"private_mode": False, "storage_path": storage, "http_server": False}
+        if icon:
+            kw["icon"] = icon
+        webview.start(**kw)
+    except Exception as e:
+        print("Finestra non disponibile:", type(e).__name__, e, file=sys.stderr, flush=True)
+        closed = shown["ok"]
+        WINDOW, WINDOW_MODE = None, False
+        if closed:  # l'utente aveva già la finestra: chiudere non deve riaprire il browser
+            stop_server(srv, th)
+            return True
+        return False
+    if not shown["ok"]:
+        print("La finestra non si è aperta.", file=sys.stderr, flush=True)
+        WINDOW, WINDOW_MODE = None, False
+        return False
+    WINDOW, WINDOW_MODE = None, False
+    stop_server(srv, th)
+    return True
+
+
+FALLBACK_MSG = (
+    "Non riesco ad aprire la finestra di Twenties Cleaning.\n\n"
+    "Manca il componente di sistema (su Windows serve WebView2, già presente su Windows 11 e sulla maggior parte di Windows 10).\n\n"
+    "Apro il programma nel browser."
+)
+
+
+def main():
+    global WINDOW, WINDOW_MODE, MODE
     global PORT, SCHEME, BASE, TLS_ON, SN, PN, G_ID, G_SECRET, DUMMY
     quiet_streams()
+    MODE = launch_mode(sys.argv)
     if sys.version_info < (3, 8):
         sys.exit("Serve Python 3.8 o più recente.")
     if not hasattr(hashlib, "scrypt"):
@@ -1587,26 +1867,23 @@ def main():
     d = data_dir()
     log_to_file(d)
     load_env(d)
+    want = int(os.environ.get("TC_PORT", "8765") or 8765)
+    if want and port_is_open(HOST, want):
+        kind, info = identify(want)
+        finish_because_busy(kind, info, want)
+        return
     G_ID = (os.environ.get("GOOGLE_CLIENT_ID") or getattr(_GC, "CLIENT_ID", "") or "").strip()
     G_SECRET = (os.environ.get("GOOGLE_CLIENT_SECRET") or getattr(_GC, "CLIENT_SECRET", "") or "").strip()
     init_db(os.path.join(d, "twenties.db"))
     DUMMY = hash_pw(secrets.token_hex(8))
-    want = int(os.environ.get("TC_PORT", "8765") or 8765)
     try:
         srv = ThreadingHTTPServer((HOST, want), H)
-    except OSError:
-        try:  # già aperta? Riporto in primo piano quella, invece di aprirne un'altra
-            with urllib.request.urlopen(f"http://{HOST}:{want}/api/focus", timeout=3) as r0:
-                j0 = json.loads(r0.read())
-            if j0.get("app") == APP:
-                if not j0.get("window"):
-                    webbrowser.open(f"http://{HOST}:{want}/")
-                return
-        except Exception:
-            pass
-        if G_ID:
-            sys.exit(f"La porta {want} è occupata (serve fissa per l'accesso con Google). Chiudi l'altra copia o imposta TC_PORT.")
-        srv = ThreadingHTTPServer((HOST, 0), H)
+    except OSError as e:
+        if want and addr_in_use(e):
+            kind, info = identify(want) if port_is_open(HOST, want) else ("other", None)
+            finish_because_busy(kind, info, want)
+            return
+        raise
     srv.daemon_threads = True
     PORT = srv.server_address[1]
     cert, keyf = os.environ.get("TC_TLS_CERT"), os.environ.get("TC_TLS_KEY")
@@ -1618,39 +1895,41 @@ def main():
         TLS_ON, SCHEME = True, "https"
         SN, PN = "__Host-tc_s", "__Host-tc_p"
     BASE = f"{SCHEME}://{HOST}:{PORT}"
-    print(f"{APP} aperto su {BASE}/")
+    print(f"{APP} {VERSION} su {BASE}/")
     print("Sicurezza: " + ("HTTPS attivo." if TLS_ON else "connessione solo locale (127.0.0.1, nulla esce dal computer). Per HTTPS vedi LEGGIMI."))
     print("Accesso con Google: " + ("attivo." if G_ID and G_SECRET else "non configurato (vedi LEGGIMI)."))
-    print("Tieni aperta questa finestra; per uscire usa il pulsante Esci o premi Ctrl+C.")
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
-    if not os.environ.get("TC_HEADLESS") and not os.environ.get("TC_BROWSER"):
-        t0 = time.time()
-        try:
-            import webview
+    if MODE == "window":
+        print("Si apre la finestra dell'app. Chiudendola, il programma termina.")
+        if run_window(srv, th, d):
             try:
-                webview.settings["ALLOW_DOWNLOADS"] = True
+                sys.stdout.flush()
+                sys.stderr.flush()
             except Exception:
                 pass
-            WINDOW = webview.create_window(APP, BASE + "/", width=1180, height=800, min_size=(820, 600))
-            WINDOW_MODE = True
-            webview.start(private_mode=False, storage_path=os.path.join(d, "webview"))
-            if time.time() - t0 > 3:  # chiusa dall'utente: esco
-                srv.shutdown()
-                return
-            print("La finestra si è chiusa subito: uso il browser.")
-        except Exception as e:
-            print("Finestra non disponibile, uso il browser:", type(e).__name__, e)
+            os._exit(0)  # niente thread rimasti di pywebview, e la porta è già libera
         WINDOW, WINDOW_MODE = None, False
-    try:
-        webbrowser.open(BASE + "/")
-    except Exception:
-        pass
+        notify(FALLBACK_MSG)
+        try:
+            webbrowser.open(BASE + "/")
+        except Exception:
+            notify(f"Apri manualmente questo indirizzo nel browser:\n{BASE}/")
+    elif MODE == "browser":
+        print("Apro il browser. Per uscire usa Chiudi app oppure premi Ctrl+C.")
+        try:
+            webbrowser.open(BASE + "/")
+        except Exception:
+            notify(f"Apri manualmente questo indirizzo nel browser:\n{BASE}/")
+    else:
+        print("Modalità senza finestra. Per uscire premi Ctrl+C.")
     try:
         while th.is_alive():
             th.join(0.5)
     except KeyboardInterrupt:
         pass
+    finally:
+        stop_server(srv, th)
 
 
 if __name__ == "__main__":

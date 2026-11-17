@@ -9,7 +9,7 @@ App **gratuita e open source** per Windows e macOS che mostra cosa occupa spazio
 - Interfaccia dell'app in italiano.
 
 ## Per gli utenti
-Scarica il file per il tuo sistema, aprilo e segui la pagina che compare nel browser. I programmi non hanno la firma a pagamento, quindi Windows e macOS mostrano un avviso la prima volta: le istruzioni sono nelle [domande frequenti](https://twoventi.github.io/twenties-cleaning/#faq).
+Scarica il file per il tuo sistema e aprilo: compare la finestra dell'app. Se su Windows manca WebView2, un messaggio lo dice e si apre il browser. I programmi non hanno la firma a pagamento, quindi Windows e macOS mostrano un avviso la prima volta: le istruzioni sono nelle [domande frequenti](https://twoventi.github.io/twenties-cleaning/#faq).
 
 ## Per chi pubblica o modifica il progetto
 
@@ -33,13 +33,16 @@ GitHub Actions costruisce `.exe` (Windows) e `.dmg` (Mac Apple Silicon e Intel),
 
 ### Prova in locale
 ```
-python3 tests/smoke_test.py      # registra, entra, elimina l'account
-python3 src/twenties_cleaning.py # avvio da codice (vedi LEGGIMI.md)
+pip install -r requirements.txt
+python3 tests/smoke_test.py      # registra, entra, elimina l'account (senza finestra)
+python3 src/twenties_cleaning.py # finestra dell'app (vedi LEGGIMI.md)
 python3 scripts/make_assets.py   # rigenera icone e illustrazioni originali
 ```
 
+Le credenziali Google, se ti servono in locale, stanno nelle variabili `GOOGLE_CLIENT_ID` e `GOOGLE_CLIENT_SECRET` oppure in `src/_google_config.py` (è nel `.gitignore`). Vedi LEGGIMI.md.
+
 ### Cosa è stato scelto
-- L'app apre il browser predefinito (non una finestra propria): l'accesso con Google non funziona nelle finestre incorporate.
+- L'app ha una finestra propria. L'accesso con Google si apre nel browser di sistema, perché Google blocca il login nelle finestre incorporate; al termine la finestra dell'app risulta connessa. Se la finestra non è disponibile, si usa il browser.
 - Nessuna firma a pagamento: i file sono verificabili con `SHA256SUMS`. Se un giorno vuoi eliminare gli avvisi, servono Apple Developer Program (99 $/anno) e un certificato di firma per Windows.
 - Nessun controllo automatico degli aggiornamenti (nessun dato esce dal computer): gli utenti seguono le *Releases* con **Watch › Custom › Releases**.
 - Il sito non usa cookie né servizi esterni: per questo non c'è un banner dei cookie.
@@ -57,6 +60,6 @@ A **free, open source** app for Windows and macOS that shows what is taking up d
 - Website, privacy, terms and cookies: **https://twoventi.github.io/twenties-cleaning/**
 - Downloads: [latest release](https://github.com/twoventi/twenties-cleaning/releases/latest) (with `SHA256SUMS` to verify the files)
 
-The programs have no paid code signature, so Windows and macOS show a warning on first launch; see the [FAQ](https://twoventi.github.io/twenties-cleaning/?lang=en#faq). To publish: run `scripts/personalize.py`, push to GitHub, enable Pages (main / docs), then push a tag like `v1.0.0` to build the releases.
+The programs have no paid code signature, so Windows and macOS show a warning on first launch; see the [FAQ](https://twoventi.github.io/twenties-cleaning/?lang=en#faq). The app opens in its own window. Google sign-in opens in the system browser (Google blocks embedded login); the app window then shows you as signed in. If the window cannot open, the browser is used instead. To publish: run `scripts/personalize.py`, push to GitHub, enable Pages (main / docs), then push a tag like `v1.0.0` to build the releases. From source: `pip install -r requirements.txt` then `python src/twenties_cleaning.py`. Local Google credentials: environment variables `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`, or `src/_google_config.py` (gitignored).
 
 License: [MIT](LICENSE).

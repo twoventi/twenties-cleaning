@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+src/_google_config.py
 build/
 dist/
 *.spec
