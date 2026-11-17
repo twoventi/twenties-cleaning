@@ -47,7 +47,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: macos-15
+          - runner: macos-latest
             suffix: AppleSilicon
           - runner: macos-15-intel
             suffix: Intel
